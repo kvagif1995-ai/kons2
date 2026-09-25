@@ -1,4 +1,6 @@
 __pycache__/
+build/
+dist/
 config.json
 _qa_*.png
 _form_*.png

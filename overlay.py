@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -90,18 +91,25 @@ def _wrap(draw: ImageDraw.ImageDraw, text: str, widths: list[int], pt: float, dp
     return lines
 
 
-def draw_checkmark(draw: ImageDraw.ImageDraw, cx: float, cy: float, dpi: float, fill=(0, 0, 0, 255)):
+def draw_checkmark(
+    draw: ImageDraw.ImageDraw,
+    cx: float,
+    cy: float,
+    dpi: float,
+    fill=(0, 0, 0, 255),
+    ink_scale: float = 1.0,
+):
     s = dpi / 25.4
     # Centre the ink on the circle. A little larger and heavier than the first mark.
     raw = [(-0.95, 0.05), (-0.25, 0.75), (0.95, -0.95)]
-    scale = 1.22
+    scale = 1.22 * ink_scale
     mid_x = (min(p[0] for p in raw) + max(p[0] for p in raw)) / 2.0
     mid_y = (min(p[1] for p in raw) + max(p[1] for p in raw)) / 2.0
     pts = [
         (cx + (x - mid_x) * scale * s, cy + ((y - mid_y) * scale + 0.12) * s)
         for x, y in raw
     ]
-    width = max(2, int(round(0.52 * s)))
+    width = max(2, int(round(0.52 * s * ink_scale)))
     draw.line(pts, fill=fill, width=width, joint="curve")
 
 
@@ -202,6 +210,7 @@ def render_overlay(
     stamp_align: str = "center",
     registration: bool = False,
     transparent: bool = True,
+    ink_scale: float = 1.0,
 ) -> Image.Image:
     """RGBA (or RGB) image of the A4 page with only the answers on it."""
     width = max(1, mm_to_px(PAGE_W_MM, dpi_x))
@@ -223,10 +232,10 @@ def render_overlay(
         if field_id == "infekt_detail" and not checks.get("infekt_ja"):
             continue
         if "box" in spec:
-            _draw_centered(draw, raw, spec, dpi_x, dpi_y, ink)
+            _draw_centered(draw, raw, spec, dpi_x, dpi_y, ink, ink_scale)
             continue
         lines_spec = spec["lines"]
-        pt = spec.get("size") or lines_spec[0]["size"]
+        pt = (spec.get("size") or lines_spec[0]["size"]) * ink_scale
         widths = [max(1, mm_to_px(line["w"], dpi_x)) for line in lines_spec]
         if len(lines_spec) == 1:
             placed = [raw]
@@ -235,7 +244,7 @@ def render_overlay(
         for line, text in zip(lines_spec, placed):
             if not text:
                 continue
-            font = _fit_font(draw, text, mm_to_px(line["w"], dpi_x), line["size"], dpi_y)
+            font = _fit_font(draw, text, mm_to_px(line["w"], dpi_x), line["size"] * ink_scale, dpi_y)
             x = mm_to_px(line["x"], dpi_x)
             y = mm_to_px(line["y"], dpi_y)
             draw.text((x, y), text, font=font, fill=ink, anchor="ls")
@@ -248,6 +257,7 @@ def render_overlay(
                 mm_to_px(cy_mm, dpi_y),
                 (dpi_x + dpi_y) / 2.0,
                 ink,
+                ink_scale,
             )
 
     if registration:
@@ -322,12 +332,20 @@ def _line_box(font) -> tuple[int, int]:
     return max(1, int(bbox[3] - bbox[1])), 0
 
 
-def _draw_centered(draw: ImageDraw.ImageDraw, text: str, spec: dict, dpi_x: float, dpi_y: float, ink):
+def _draw_centered(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    spec: dict,
+    dpi_x: float,
+    dpi_y: float,
+    ink,
+    ink_scale: float = 1.0,
+):
     box = spec["box"]
     max_w = max(1, mm_to_px(box["w"], dpi_x))
     max_h = max(1, mm_to_px(box["h"], dpi_y))
     bold = bool(spec.get("bold"))
-    px = _pt_to_px(spec.get("size", 18), dpi_y)
+    px = _pt_to_px(spec.get("size", 18) * ink_scale, dpi_y)
     font = _font(px, bold)
     placed: list[str] = []
     while True:
@@ -394,8 +412,15 @@ def _paste_stamp(
         image.paste(stamp, (left, top), stamp)
 
 
+def _bundle_dir() -> Path:
+    """Folder that holds bundled files. Next to the sources, or inside a frozen exe."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return Path(__file__).resolve().parent
+
+
 def render_form_page(dpi_x: float, dpi_y: float) -> Image.Image:
-    pdf_path = Path(__file__).resolve().parent / "Konsil_Formular_empty.pdf"
+    pdf_path = _bundle_dir() / "Konsil_Formular_empty.pdf"
     pdf = pdfium.PdfDocument(str(pdf_path))
     try:
         page = pdf[0]
@@ -417,6 +442,7 @@ def compose_preview(
     registration: bool,
     form_page: Image.Image | None = None,
     stamp_align: str = "center",
+    ink_scale: float = 1.0,
 ) -> Image.Image:
     """Screen image: scanned form in the background, answers on top. Not sent to the printer."""
     if form_page is None:
@@ -431,6 +457,7 @@ def compose_preview(
         stamp_align=stamp_align,
         registration=registration,
         transparent=True,
+        ink_scale=ink_scale,
     )
     if overlay.size != form_page.size:
         overlay = overlay.resize(form_page.size, Image.Resampling.LANCZOS)

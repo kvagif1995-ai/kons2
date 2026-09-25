@@ -1,27 +1,34 @@
 """Fill the Konsil form on screen and print only the answers onto the paper form.
 
-The scanned form stays on the monitor so the typing can be checked against the
-real layout. The printer receives the text, the marks and the chosen label PDF.
-Put the blank paper forms in the tray.
+Answers are typed straight onto the scanned form. The printer receives the text,
+the marks and the chosen label PDF. Put the blank paper forms in the tray.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import tkinter as tk
 from datetime import date
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 import gdi_print
 import overlay
-from form_layout import PAGE_H_MM, PAGE_W_MM, STAMP_DEFAULT
+from form_layout import CHECKS, STAMP_DEFAULT, TEXT_FIELDS
 from overlay import mm_to_px
 
-ROOT = Path(__file__).resolve().parent
+def _install_dir() -> Path:
+    """Folder the user runs. Settings stay beside the exe."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+ROOT = _install_dir()
 CONFIG_PATH = ROOT / "config.json"
 PREVIEW_DPI = 120
 
@@ -40,7 +47,68 @@ RISK_KEYS = (
     "nicht_gehfaehig", "kommunikat", "suizidal", "fluchtgefahr",
 )
 BILL_KEYS = ("versichert", "befreit", "goae", "bema", "hilfsmittel", "privat")
-DATE_KEYS = ("brief_datum", "verw_datum")
+INFEKT_MARKS = {"infekt_ja": "ja", "infekt_nein": "nein", "infekt_nicht": "nicht"}
+TRANSPORT_MARKS = {"gehend": "gehend", "fahrdienst": "fahrdienst", "ktw": "ktw"}
+KTW_MARKS = {"liegend": "liegend", "sitzend": "sitzend"}
+BEGLEIT_MARKS = {"begleit_anz_mark": "anz", "begleit_nein": "nein", "begleit_station": "station"}
+CHECK_HIT_MM = 3.0
+
+# Order in the Felder dialog, and the order of the boxes on the page.
+FIELD_ORDER = (
+    "fachrichtung",
+    "ihr_zeichen", "unser_zeichen", "sachbearbeiter", "brief_datum",
+    "stamp_path",
+    "geb_am", "station", "beh_arzt", "tel",
+    "fragestellung", "vorbefunde",
+    "infekt", "infekt_detail",
+    "risiken", "risiko_etc",
+    "transport", "begleit_anz",
+    "diagnose", "oa_name", "aa_name",
+    "abrechnung", "kasse", "hilfsmittel_text", "privat_text", "abrechnung_notiz",
+    "termin", "uhrzeit", "begl_person", "verw_datum", "verw_name",
+)
+CAPTIONS = {
+    "fachrichtung": "Fachrichtung, links oben",
+    "ihr_zeichen": "Ihr Zeichen",
+    "unser_zeichen": "Unser Zeichen",
+    "sachbearbeiter": "Sachbearbeiter",
+    "brief_datum": "Datum oben",
+    "stamp_path": "Etikett-PDF",
+    "geb_am": "geb. am",
+    "station": "Station",
+    "beh_arzt": "Beh. Arzt im Bezirkskrankenhaus",
+    "tel": "Tel.-Nr. (bei Rückfrage)",
+    "fragestellung": "Fragestellung",
+    "vorbefunde": "Wichtige Vorbefunde",
+    "infekt": "Infektiosität",
+    "infekt_detail": "Bei ja, kurzer Zusatz (z. B. HIV)",
+    "risiken": "Kreuze, Risiken",
+    "risiko_etc": "etc.",
+    "transport": "Angaben zum Transport",
+    "begleit_anz": "Anzahl Begleitpersonen",
+    "diagnose": "Psychiatrische Diagnose",
+    "oa_name": "Name Oberarzt",
+    "aa_name": "Name Ass. Arzt",
+    "abrechnung": "Kreuze, Abrechnung",
+    "kasse": "Kasse",
+    "hilfsmittel_text": "Hilfsmittel, Kostenträger",
+    "privat_text": "Privatpatient, Zusatz",
+    "abrechnung_notiz": "Freie Zeile unter der Abrechnung",
+    "termin": "Termin am",
+    "uhrzeit": "Uhrzeit",
+    "begl_person": "Begl.-Person",
+    "verw_datum": "Lohr a. Main, den",
+    "verw_name": "Name Verwaltung",
+}
+MARK_GROUPS = {
+    "infekt": ("infekt_ja", "infekt_nein", "infekt_nicht"),
+    "risiken": RISK_KEYS,
+    "transport": (
+        "gehend", "fahrdienst", "ktw", "liegend", "sitzend",
+        "begleit_anz_mark", "begleit_nein", "begleit_station",
+    ),
+    "abrechnung": BILL_KEYS,
+}
 
 def _today() -> str:
     return date.today().strftime("%d.%m.%Y")
@@ -64,34 +132,40 @@ class FormApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Konsil — Druck auf Vordruck")
-        self.geometry("1280x860")
-        self.minsize(1040, 700)
+        self.geometry("1180x920")
+        self.minsize(880, 680)
         self._ready = False
         self._after_id = None
         self._photo = None
         self._preview_scale = 1.0
+        self._page_ox = 0.0
+        self._page_oy = 0.0
+        self._zoom = 100
+        self._ink = 100
+        self.zoom_pct = tk.StringVar(value="100 %")
+        self.ink_pct = tk.StringVar(value="100 %")
         self._form_page = None
         self._stamp_key = None
         self._stamp_image = None
         self._printing = False
+        self._image_id = None
+        self._hover_id = None
+        self._baseline_cache: dict[tuple, int] = {}
+        self._wrap_draw = None
 
-        self.entries: dict[str, tk.StringVar] = {}
-        self.texts: dict[str, tk.Text] = {}
         self.bools: dict[str, tk.BooleanVar] = {}
         self.important: dict[str, tk.BooleanVar] = {}
         self.remember: dict[str, tk.BooleanVar] = {}
-        self._field_labels: dict[str, ttk.Label] = {}
         self._field_order: list[str] = []
         self._field_inputs: dict[str, tk.Entry | tk.Text] = {}
-        self._group_frames: dict[str, tk.Frame] = {}
-        self._blocks: list[tuple[str, ttk.Frame]] = []
-        self._layout_ready = False
-        self._suspend_layout = False
+        self._lines: dict[str, list[tk.Entry]] = {}
+        self._windows: dict[str, int] = {}
+        self._tab_chain: list[tk.Widget] = []
 
         self.printer = tk.StringVar()
         self.copies = tk.StringVar(value="1")
-        self.shift_x = tk.StringVar(value="-9.0")
-        self.shift_y = tk.StringVar(value="-1.0")
+        self.shift_x = tk.StringVar(value="-10.0")
+        self.shift_y = tk.StringVar(value="-2.0")
         self.stamp_path = tk.StringVar()
         self.stamp_x = tk.StringVar(value=f"{STAMP_DEFAULT['x']:.1f}")
         self.stamp_y = tk.StringVar(value=f"{STAMP_DEFAULT['y']:.1f}")
@@ -100,7 +174,9 @@ class FormApp(tk.Tk):
         self.stamp_mode = tk.StringVar(value="native")
         self.show_marks = tk.BooleanVar(value=False)
         self.paper_info = tk.StringVar(value="Kein Drucker gewählt")
-        self.cursor_info = tk.StringVar(value="Umschalt+Klick in die Vorschau setzt die Etikett-Ecke")
+        self.cursor_info = tk.StringVar(
+            value="Ins Formular schreiben · Kreis anklicken · Umschalt+Klick setzt die Etikett-Ecke"
+        )
 
         self.infekt = tk.StringVar(value="")
         self.transport = tk.StringVar(value="")
@@ -133,25 +209,25 @@ class FormApp(tk.Tk):
             self,
             style="Hint.TLabel",
             text=(
+                "Direkt ins Formular schreiben. Ein Kreis setzt oder löscht das Kreuz. "
+                "Doppelklick auf das Etikett wählt die PDF, Umschalt+Klick setzt seine Ecke. "
                 "Gedruckt werden nur die Einträge und das Etikett — das Formular selbst bleibt auf dem Papier. "
                 "Drucken öffnet den normalen Druckdialog. Unter Einstellungen: Auftrag → Privater Druck, "
                 "Grundlagen → Quelle Universal. Formulare erst am Gerät in die Universalzufuhr legen "
                 "und den Auftrag dort mit dem Code starten."
             ),
-            wraplength=1200,
+            wraplength=1100,
         )
         hint.pack(fill="x", padx=12, pady=(8, 4))
+        self.bind(
+            "<Configure>",
+            lambda e, label=hint: label.configure(wraplength=max(280, e.width - 24)) if e.widget is self else None,
+            add="+",
+        )
 
-        paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
-        paned.pack(fill="both", expand=True, padx=8, pady=4)
-
-        form_wrap = ttk.Frame(paned)
-        preview_wrap = ttk.Frame(paned)
-        paned.add(form_wrap, weight=3)
-        paned.add(preview_wrap, weight=4)
-
-        self._build_form(form_wrap)
-        self._build_preview(preview_wrap)
+        self._build_toolbar()
+        self._build_preview()
+        self._build_fields()
         self._build_printer_bar()
 
         for var in (
@@ -161,61 +237,438 @@ class FormApp(tk.Tk):
             var.trace_add("write", lambda *_: self.schedule())
         self.show_marks.trace_add("write", lambda *_: self.schedule())
 
-    def _build_form(self, parent):
-        bar = ttk.Frame(parent)
-        bar.pack(fill="x")
-        ttk.Button(bar, text="Felder…", command=self.open_field_settings).pack(side="left", padx=(8, 4), pady=4)
-        ttk.Label(bar, text="Wichtig und Merken", style="Hint.TLabel").pack(side="left")
+    def _build_toolbar(self):
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=8, pady=(0, 4))
 
-        canvas = tk.Canvas(parent, highlightthickness=0, bg="#f4f7f8")
-        scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        body = ttk.Frame(canvas)
-        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        window = canvas.create_window((0, 0), window=body, anchor="nw")
-        canvas.configure(yscrollcommand=scroll.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        row = ttk.Frame(bar)
+        row.pack(fill="x")
+        ttk.Button(row, text="Felder…", command=self.open_field_settings).pack(side="left", padx=(0, 4))
+        ttk.Button(row, text="Beispiel füllen", command=self.fill_example).pack(side="left", padx=4)
+        ttk.Button(row, text="Nicht gemerkte leeren", command=self.clear_fields).pack(side="left", padx=4)
+        ttk.Button(row, text="Speichern…", command=self.save_dialog).pack(side="left", padx=4)
+        ttk.Button(row, text="Öffnen…", command=self.open_dialog).pack(side="left", padx=4)
+        ttk.Checkbutton(row, text="Passkreuze", variable=self.show_marks).pack(side="left", padx=(12, 4))
+        view = ttk.Frame(row)
+        view.pack(side="right")
+        self._stepper(view, "Zoom", self.zoom_pct, self._bump_zoom)
+        self._stepper(view, "Schrift", self.ink_pct, self._bump_ink)
 
-        def wheel(event):
-            if isinstance(event.widget, tk.Text):
+        stamp = ttk.Frame(bar)
+        stamp.pack(fill="x", pady=(4, 0))
+        ttk.Label(stamp, text="Etikett").pack(side="left")
+        ttk.Entry(stamp, textvariable=self.stamp_path).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(stamp, text="Wählen…", command=self.browse_stamp).pack(side="left")
+        ttk.Button(stamp, text="Entfernen", command=lambda: self.stamp_path.set("")).pack(side="left", padx=(6, 8))
+        ttk.Radiobutton(stamp, text="Originalgröße", variable=self.stamp_mode, value="native").pack(side="left")
+        ttk.Radiobutton(stamp, text="einpassen", variable=self.stamp_mode, value="fit").pack(side="left", padx=(6, 8))
+        self._mm_entry(stamp, self.stamp_x, "X")
+        self._mm_entry(stamp, self.stamp_y, "Y")
+        self._mm_entry(stamp, self.stamp_w, "B")
+        self._mm_entry(stamp, self.stamp_h, "H")
+        ttk.Label(bar, textvariable=self.cursor_info, style="Hint.TLabel").pack(fill="x", pady=(3, 0))
+
+    def _stepper(self, parent, caption: str, variable: tk.StringVar, command):
+        ttk.Label(parent, text=caption).pack(side="left", padx=(12, 4))
+        ttk.Button(parent, text="−", width=3, command=lambda: command(-10)).pack(side="left")
+        ttk.Label(parent, textvariable=variable, width=6, anchor="center").pack(side="left", padx=2)
+        ttk.Button(parent, text="+", width=3, command=lambda: command(10)).pack(side="left")
+
+    def _bump_zoom(self, step: int):
+        self._zoom = max(50, min(250, self._zoom + step))
+        self.zoom_pct.set(f"{self._zoom} %")
+        self.schedule()
+
+    def _bump_ink(self, step: int):
+        self._ink = max(100, min(200, self._ink + step))
+        self.ink_pct.set(f"{self._ink} %")
+        self.schedule()
+
+    def _ink_factor(self) -> float:
+        return self._ink / 100.0
+
+    def _build_preview(self):
+        holder = ttk.Frame(self)
+        holder.pack(fill="both", expand=True, padx=8, pady=4)
+        self.preview = tk.Canvas(holder, bg="#d5dee2", highlightthickness=0)
+        yscroll = ttk.Scrollbar(holder, orient="vertical", command=self.preview.yview)
+        xscroll = ttk.Scrollbar(holder, orient="horizontal", command=self.preview.xview)
+        self.preview.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        xscroll.pack(side="bottom", fill="x")
+        yscroll.pack(side="right", fill="y")
+        self.preview.pack(side="left", fill="both", expand=True)
+        self.preview.bind("<Configure>", lambda _e: self.schedule())
+        self.preview.bind("<Motion>", self._on_preview_motion)
+        self.preview.bind("<Button-1>", self._on_preview_click)
+        self.preview.bind("<Double-Button-1>", self._on_preview_double)
+        self.preview.bind("<MouseWheel>", self._wheel)
+        self._hover_id = self.preview.create_oval(
+            -20, -20, -20, -20, outline="#1a6f8a", width=2, state="hidden", tags="hover",
+        )
+
+    def _build_fields(self):
+        for key in (*RISK_KEYS, *BILL_KEYS):
+            self.bools[key] = tk.BooleanVar(value=False)
+        for key in FIELD_ORDER:
+            self._ensure_flags(key)
+        for key in FIELD_ORDER:
+            if key not in TEXT_FIELDS:
+                continue
+            spec = TEXT_FIELDS[key]
+            if "lines" in spec and len(spec["lines"]) > 1:
+                entries = [self._make_entry() for _ in spec["lines"]]
+                self._lines[key] = entries
+                self._field_inputs[key] = entries[0]
+                for entry in entries:
+                    self._remember_field(entry)
+            elif "box" in spec:
+                widget = self._make_block()
+                self._field_inputs[key] = widget
+                self._remember_field(widget, newline=True)
+                self._limit_lines(widget, 2)
+            else:
+                widget = self._make_entry()
+                self._field_inputs[key] = widget
+                self._remember_field(widget)
+        self._apply_all_importance()
+
+    def _make_entry(self) -> tk.Entry:
+        widget = tk.Entry(
+            self.preview,
+            font=("Arial", 10),
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            bg="#fffef8",
+            fg="#142028",
+            highlightbackground="#c5d0d6",
+            highlightcolor="#1a6f8a",
+            insertbackground="#142028",
+            selectbackground="#1a6f8a",
+            selectforeground="white",
+        )
+        self._embed(widget)
+        return widget
+
+    def _make_block(self) -> tk.Text:
+        widget = tk.Text(
+            self.preview,
+            font=("Arial", 14, "bold"),
+            wrap="word",
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            bg="#fffef8",
+            fg="#142028",
+            highlightbackground="#c5d0d6",
+            highlightcolor="#1a6f8a",
+            insertbackground="#142028",
+            selectbackground="#1a6f8a",
+            selectforeground="white",
+            undo=True,
+            padx=4,
+            pady=2,
+        )
+        widget.tag_configure("center", justify="center")
+        widget.bind("<KeyRelease>", lambda _e, box=widget: box.tag_add("center", "1.0", "end"), add="+")
+        self._embed(widget)
+        return widget
+
+    def _embed(self, widget: tk.Widget):
+        item = self.preview.create_window(-2000, -2000, window=widget, anchor="nw", tags="field")
+        self._windows[str(widget)] = item
+        widget.bind("<FocusIn>", lambda _e, mark=item, box=widget: self._focus_field(mark, box), add="+")
+
+    def _remember_field(self, widget: tk.Widget, newline: bool = False):
+        self._tab_chain.append(widget)
+        widget.bind("<MouseWheel>", self._wheel, add="+")
+        widget.bind("<Tab>", self._tab_next, add="+")
+        widget.bind("<Shift-Tab>", self._tab_prev, add="+")
+        widget.bind("<ISO_Left_Tab>", self._tab_prev, add="+")
+        if not newline:
+            widget.bind("<Return>", self._tab_next, add="+")
+            widget.bind("<KeyRelease>", lambda _e, box=widget: self._paint_overflow(box), add="+")
+
+    def _focus_field(self, item: int, _widget: tk.Widget):
+        self.preview.tag_raise(item)
+        self._reveal_item(item)
+
+    def _reveal_item(self, item: int):
+        _x, y = self.preview.coords(item)
+        height = float(self.preview.itemcget(item, "height") or 0)
+        view_h = self.preview.winfo_height()
+        if view_h < 40:
+            return
+        top = self.preview.canvasy(0)
+        if top + 12 <= y and y + height <= top + view_h - 12:
+            return
+        region = self.preview.bbox("page")
+        total = (region[3] - region[1]) if region else 0
+        if total <= view_h:
+            return
+        target = max(0.0, y - view_h * 0.28)
+        self.preview.yview_moveto(target / total)
+        self.preview.update_idletasks()
+
+    def _limit_lines(self, widget: tk.Text, limit: int):
+        def block_extra(event, box=widget):
+            if event.keysym != "Return":
+                return None
+            current = int(box.index("end-1c").split(".")[0])
+            if current >= limit:
+                return "break"
+            return None
+
+        def trim_extra(_event=None, box=widget):
+            end_line = int(box.index("end-1c").split(".")[0])
+            if end_line <= limit:
                 return
-            canvas.yview_scroll(int(-event.delta / 120), "units")
+            extra = box.get(f"{limit + 1}.0", "end-1c").strip()
+            box.delete(f"{limit}.end", "end")
+            if extra:
+                box.insert(f"{limit}.end", " " + extra)
+            box.tag_add("center", "1.0", "end")
 
-        def bind_wheel(_event):
-            canvas.bind_all("<MouseWheel>", wheel)
+        widget.bind("<Return>", block_extra, add="+")
+        widget.bind("<KeyRelease>", lambda _e: trim_extra(), add="+")
+        widget.bind("<<Paste>>", lambda _e: widget.after(10, trim_extra), add="+")
 
-        def unbind_wheel(_event):
-            canvas.unbind_all("<MouseWheel>")
+    def _wheel(self, event):
+        if event.state & 0x0004:
+            self._bump_zoom(10 if event.delta > 0 else -10)
+            return "break"
+        self.preview.yview_scroll(int(-event.delta / 120), "units")
+        return "break"
 
-        canvas.bind("<Enter>", bind_wheel)
-        canvas.bind("<Leave>", unbind_wheel)
-        self._form_body = body
-        self._field_host = body
-        self._important_head = ttk.Label(body, text="Zuerst ausfüllen", style="Important.TLabel")
-        self._optional_head = ttk.Label(body, text="Weitere Angaben", style="Optional.TLabel")
+    def _tab_next(self, event):
+        self._move_tab(event.widget, 1)
+        return "break"
 
-        self._section_kopf(body)
-        self._section_patient(body)
-        self._section_klinik(body)
-        self._section_risiken(body)
-        self._section_transport(body)
-        self._section_diagnose(body)
-        self._section_abrechnung(body)
+    def _tab_prev(self, event):
+        self._move_tab(event.widget, -1)
+        return "break"
 
-        actions = ttk.Frame(body)
-        self._actions = actions
-        ttk.Button(actions, text="Beispiel füllen", command=self.fill_example).pack(side="left")
-        ttk.Button(actions, text="Nicht gemerkte leeren", command=self.clear_fields).pack(side="left", padx=6)
-        ttk.Button(actions, text="Speichern…", command=self.save_dialog).pack(side="left", padx=6)
-        ttk.Button(actions, text="Öffnen…", command=self.open_dialog).pack(side="left")
-        self._layout_ready = True
-        self._place_blocks()
+    def _move_tab(self, widget, step: int):
+        if not self._tab_chain:
+            return
+        try:
+            index = self._tab_chain.index(widget)
+        except ValueError:
+            index = 0 if step > 0 else -1
+        nxt = self._tab_chain[(index + step) % len(self._tab_chain)]
+        item = self._windows.get(str(nxt))
+        if item is not None:
+            self._reveal_item(item)
+        nxt.focus_set()
 
-    def _section(self, parent, title: str) -> ttk.LabelFrame:
-        frame = ttk.LabelFrame(parent, text=title, padding=8)
-        frame.pack(fill="x", padx=8, pady=4)
-        return frame
+    def _paint_overflow(self, widget: tk.Entry):
+        limit = getattr(widget, "_max_text_px", 0)
+        if limit <= 0:
+            return
+        font = tkfont.Font(font=widget.cget("font"))
+        too_wide = font.measure(widget.get()) > limit - 6
+        widget.configure(fg="#8a1f1f" if too_wide else "#142028")
+
+    def _style_input(self, widget: tk.Widget, important: bool):
+        widget.configure(
+            bg="#fff3cc" if important else "#fffef8",
+            highlightbackground="#c47b12" if important else "#c5d0d6",
+            highlightcolor="#1a6f8a",
+        )
+
+    def _widgets_for(self, key: str) -> list[tk.Widget]:
+        lines = self._lines.get(key)
+        if lines:
+            return list(lines)
+        widget = self._field_inputs.get(key)
+        return [widget] if widget is not None else []
+
+    def _px(self, mm: float) -> float:
+        return mm / 25.4 * PREVIEW_DPI * self._preview_scale
+
+    def _screen_pt(self, size_pt: float) -> int:
+        ppi = self.winfo_fpixels("1i") or 96.0
+        screen_px = size_pt * self._ink_factor() * (PREVIEW_DPI / 72.0) * self._preview_scale
+        return max(6, int(round(screen_px * 72.0 / ppi)))
+
+    def _baseline_offset(self, font_spec) -> int:
+        key = tuple(font_spec)
+        cached = self._baseline_cache.get(key)
+        if cached is not None:
+            return cached
+        probe = tk.Entry(
+            self, font=font_spec, relief="flat", bd=0, highlightthickness=1,
+        )
+        probe.insert(0, "Hg")
+        probe.place(x=-800, y=-800)
+        self.update_idletasks()
+        box = probe.bbox(0)
+        ascent = tkfont.Font(font=font_spec).metrics("ascent")
+        offset = (box[1] + ascent) if box else (ascent + 1)
+        probe.destroy()
+        self._baseline_cache[key] = offset
+        return offset
+
+    def _layout_fields(self):
+        if self._preview_scale <= 0 or not self._windows:
+            return
+        editing = not self.show_marks.get()
+        for key, spec in TEXT_FIELDS.items():
+            if "box" in spec:
+                self._layout_box(key, spec, editing)
+            elif key in self._lines:
+                for widget, line in zip(self._lines[key], spec["lines"]):
+                    self._layout_line(widget, line, editing, bold=False)
+            else:
+                widget = self._field_inputs.get(key)
+                if widget is not None:
+                    self._layout_line(widget, spec["lines"][0], editing, bold=False)
+        self._uncollide_fields()
+        self._draw_importance_marks()
+        self.preview.tag_raise("hover")
+        self.preview.tag_raise("field")
+
+    def _layout_line(self, widget: tk.Entry, line: dict, editing: bool, bold: bool):
+        size = float(line["size"])
+        max_h = self._px(5.4 * self._ink_factor())
+        pt = self._screen_pt(size)
+        weight = "bold" if bold else "normal"
+        font_spec = ("Arial", pt, "bold") if bold else ("Arial", pt)
+        while pt > 6:
+            font_spec = ("Arial", pt, "bold") if bold else ("Arial", pt)
+            metrics = tkfont.Font(family="Arial", size=pt, weight=weight)
+            if metrics.metrics("ascent") + metrics.metrics("descent") + 2 <= max_h:
+                break
+            pt -= 1
+            font_spec = ("Arial", pt, "bold") if bold else ("Arial", pt)
+        if getattr(widget, "_laid_pt", None) != pt or getattr(widget, "_laid_bold", None) != bold:
+            widget.configure(font=font_spec)
+            widget._laid_pt = pt
+            widget._laid_bold = bold
+        offset = self._baseline_offset(font_spec)
+        descent = tkfont.Font(font=font_spec).metrics("descent")
+        left = self._page_ox + self._px(line["x"])
+        top = self._page_oy + self._px(line["y"]) - offset
+        width = max(14, self._px(line["w"]))
+        height = max(12, offset + descent + 2)
+        widget._max_text_px = width
+        self._move_window(widget, left, top, width, height, editing)
+        self._paint_overflow(widget)
+
+    def _uncollide_fields(self):
+        """Keep two boxes on the same line from covering each other."""
+        placed = []
+        for key in TEXT_FIELDS:
+            for widget in self._widgets_for(key):
+                if not isinstance(widget, tk.Entry):
+                    continue
+                item = self._windows.get(str(widget))
+                if item is None:
+                    continue
+                x, y = self.preview.coords(item)
+                width = int(float(self.preview.itemcget(item, "width")))
+                placed.append([item, widget, x, y, width])
+        placed.sort(key=lambda row: (row[3], row[2]))
+        for index, row in enumerate(placed):
+            for other in placed[index + 1 :]:
+                if other[3] - row[3] > 6:
+                    break
+                if abs(other[3] - row[3]) > 4:
+                    continue
+                if row[2] + row[4] > other[2] - 3:
+                    row[4] = max(16, int(other[2] - row[2] - 3))
+                    self.preview.itemconfigure(row[0], width=row[4])
+                    row[1]._max_text_px = row[4]
+                    self._paint_overflow(row[1])
+
+    def _layout_box(self, key: str, spec: dict, editing: bool):
+        widget = self._field_inputs[key]
+        box = spec["box"]
+        inset = self._px(0.8)
+        left = self._page_ox + self._px(box["x"]) + inset
+        top = self._page_oy + self._px(box["y"]) + inset
+        width = max(20, self._px(box["w"]) - inset * 2)
+        height = max(20, self._px(box["h"]) - inset * 2)
+        pt = self._screen_pt(float(spec.get("size", 18)))
+        # Keep two lines inside the empty block.
+        while pt > 8:
+            font = tkfont.Font(family="Arial", size=pt, weight="bold")
+            if font.metrics("linespace") * 2 + 8 <= height:
+                break
+            pt -= 1
+        if getattr(widget, "_laid_pt", None) != pt:
+            widget.configure(font=("Arial", pt, "bold"))
+            widget._laid_pt = pt
+        self._move_window(widget, left, top, width, height, editing)
+
+    def _move_window(self, widget: tk.Widget, x: float, y: float, w: float, h: float, editing: bool):
+        item = self._windows[str(widget)]
+        self.preview.coords(item, x, y)
+        self.preview.itemconfigure(
+            item,
+            width=max(8, int(round(w))),
+            height=max(8, int(round(h))),
+            state="normal" if editing else "hidden",
+        )
+
+    def _draw_importance_marks(self):
+        self.preview.delete("important-mark")
+        if self.show_marks.get() or self._preview_scale <= 0:
+            return
+        radius = self._px(2.6)
+        for key, marks in MARK_GROUPS.items():
+            var = self.important.get(key)
+            if var is None or not var.get():
+                continue
+            for mark in marks:
+                cx, cy = CHECKS[mark]
+                x = self._page_ox + self._px(cx)
+                y = self._page_oy + self._px(cy)
+                self.preview.create_oval(
+                    x - radius, y - radius, x + radius, y + radius,
+                    outline="#c47b12", width=2, tags="important-mark",
+                )
+
+    def _nearest_mark(self, x_mm: float, y_mm: float) -> str | None:
+        best = None
+        best_d = CHECK_HIT_MM * CHECK_HIT_MM
+        for key, (cx, cy) in CHECKS.items():
+            dist = (cx - x_mm) ** 2 + (cy - y_mm) ** 2
+            if dist <= best_d:
+                best = key
+                best_d = dist
+        return best
+
+    def _toggle_mark(self, key: str):
+        if key in INFEKT_MARKS:
+            value = INFEKT_MARKS[key]
+            self.infekt.set("" if self.infekt.get() == value else value)
+        elif key in TRANSPORT_MARKS:
+            value = TRANSPORT_MARKS[key]
+            if self.transport.get() == value:
+                self.transport.set("")
+                self.ktw_mode.set("")
+            else:
+                self.transport.set(value)
+                if value != "ktw":
+                    self.ktw_mode.set("")
+        elif key in KTW_MARKS:
+            value = KTW_MARKS[key]
+            if self.transport.get() == "ktw" and self.ktw_mode.get() == value:
+                self.ktw_mode.set("")
+            else:
+                self.transport.set("ktw")
+                self.ktw_mode.set(value)
+        elif key in BEGLEIT_MARKS:
+            value = BEGLEIT_MARKS[key]
+            self.begleit.set("" if self.begleit.get() == value else value)
+        elif key in self.bools:
+            self.bools[key].set(not self.bools[key].get())
+        self.schedule()
+
+    def _point_in_stamp(self, x_mm: float, y_mm: float) -> bool:
+        box = self._stamp_box()
+        return box["x"] <= x_mm <= box["x"] + box["w"] and box["y"] <= y_mm <= box["y"] + box["h"]
 
     def _ensure_flags(self, key: str):
         if key in self.important:
@@ -225,14 +678,30 @@ class FormApp(tk.Tk):
         self.important[key].trace_add("write", lambda *_k, field=key: self._apply_importance(field))
         self._field_order.append(key)
 
-    def _flag_line(self, parent, key: str, caption: str):
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(2, 2))
-        title = ttk.Label(row, text=caption, style="Optional.TLabel")
-        title.pack(side="left")
-        self._field_labels[key] = title
-        self._ensure_flags(key)
-        self._apply_importance(key)
+    def _kept(self, key: str) -> bool:
+        var = self.remember.get(key)
+        return bool(var and var.get())
+
+    def _mm_entry(self, parent, variable: tk.StringVar, label: str) -> ttk.Entry:
+        ttk.Label(parent, text=label).pack(side="left", padx=(8, 2))
+        entry = ttk.Entry(parent, textvariable=variable, width=6)
+        entry.pack(side="left")
+        return entry
+
+    def _apply_importance(self, key: str):
+        important = bool(self.important.get(key) and self.important[key].get())
+        for widget in self._widgets_for(key):
+            self._style_input(widget, important)
+        if getattr(self, "preview", None) is not None:
+            self._draw_importance_marks()
+
+    def _apply_all_importance(self):
+        for key in self.important:
+            important = bool(self.important[key].get())
+            for widget in self._widgets_for(key):
+                self._style_input(widget, important)
+        if getattr(self, "preview", None) is not None:
+            self._draw_importance_marks()
 
     def open_field_settings(self):
         existing = getattr(self, "_settings", None)
@@ -248,7 +717,7 @@ class FormApp(tk.Tk):
         win.minsize(420, 360)
         ttk.Label(
             win, style="Hint.TLabel", wraplength=520,
-            text="Wichtig steht oben und ist hervorgehoben. Merken bleibt beim nächsten Start erhalten.",
+            text="Wichtig ist auf dem Formular gelb markiert. Merken bleibt beim nächsten Start erhalten.",
         ).pack(fill="x", padx=12, pady=(10, 6))
         ttk.Button(win, text="Schließen", command=win.destroy).pack(side="bottom", anchor="e", padx=12, pady=8)
 
@@ -273,332 +742,9 @@ class FormApp(tk.Tk):
         ttk.Label(body, text="Merken", style="Status.TLabel").grid(row=0, column=2, padx=8, pady=(4, 2))
         body.columnconfigure(0, weight=1)
         for index, key in enumerate(self._field_order, start=1):
-            label = self._field_labels.get(key)
-            name = label.cget("text") if label is not None else key
-            ttk.Label(body, text=name).grid(row=index, column=0, sticky="w", padx=8, pady=2)
+            ttk.Label(body, text=CAPTIONS.get(key, key)).grid(row=index, column=0, sticky="w", padx=8, pady=2)
             ttk.Checkbutton(body, variable=self.important[key]).grid(row=index, column=1, padx=8, pady=2)
             ttk.Checkbutton(body, variable=self.remember[key]).grid(row=index, column=2, padx=8, pady=2)
-
-    def _apply_importance(self, key: str, reorder: bool = True):
-        label = self._field_labels.get(key)
-        widget = self._field_inputs.get(key)
-        important = bool(self.important.get(key) and self.important[key].get())
-        if label is not None:
-            label.configure(style="Important.TLabel" if important else "Optional.TLabel")
-        if widget is not None:
-            widget.configure(
-                bg="#fff3cc" if important else "#ffffff",
-                highlightbackground="#c47b12" if important else "#c5ced4",
-                highlightcolor="#1a6f8a",
-            )
-        group = self._group_frames.get(key)
-        if group is not None:
-            group.configure(bg="#fff3cc" if important else "#f4f7f8")
-        if reorder and self._layout_ready and not self._suspend_layout:
-            self._place_blocks()
-
-    def _apply_all_importance(self):
-        for key in self.important:
-            self._apply_importance(key, reorder=False)
-        if self._layout_ready and not self._suspend_layout:
-            self._place_blocks()
-
-    def _block(self, key: str) -> ttk.Frame:
-        frame = ttk.Frame(self._field_host)
-        self._blocks.append((key, frame))
-        return frame
-
-    def _place_blocks(self):
-        """Important fields first, the rest underneath, in form order within each group."""
-        if not self._blocks:
-            return
-        important = []
-        optional = []
-        for key, frame in self._blocks:
-            frame.pack_forget()
-            var = self.important.get(key)
-            if var is not None and var.get():
-                important.append(frame)
-            else:
-                optional.append(frame)
-        self._important_head.pack_forget()
-        self._optional_head.pack_forget()
-        self._actions.pack_forget()
-        if important:
-            self._important_head.pack(fill="x", padx=8, pady=(8, 2))
-            for frame in important:
-                frame.pack(fill="x", padx=8, pady=2)
-        if optional:
-            self._optional_head.pack(fill="x", padx=8, pady=(14, 2))
-            for frame in optional:
-                frame.pack(fill="x", padx=8, pady=2)
-        self._actions.pack(fill="x", padx=8, pady=(8, 12))
-
-    def _highlight_host(self, parent, key: str) -> tk.Frame:
-        host = tk.Frame(parent, bg="#f4f7f8", padx=6, pady=4)
-        host.pack(fill="x", pady=(0, 4))
-        self._group_frames[key] = host
-        self._apply_importance(key)
-        return host
-
-    def _kept(self, key: str) -> bool:
-        var = self.remember.get(key)
-        return bool(var and var.get())
-
-    def _entry(self, parent, key: str, label: str, width: int = 24) -> tk.Entry:
-        title = ttk.Label(parent, text=label, style="Optional.TLabel")
-        title.pack(anchor="w")
-        self._field_labels[key] = title
-        self._ensure_flags(key)
-        var = tk.StringVar()
-        var.trace_add("write", lambda *_: self.schedule())
-        entry = tk.Entry(
-            parent, textvariable=var, width=width, font=("Segoe UI", 10),
-            relief="solid", bd=1, highlightthickness=1,
-        )
-        entry.pack(anchor="w", fill="x", pady=(0, 6))
-        self.entries[key] = var
-        self._field_inputs[key] = entry
-        self._apply_importance(key)
-        return entry
-
-    def _mm_entry(self, parent, variable: tk.StringVar, label: str) -> ttk.Entry:
-        ttk.Label(parent, text=label).pack(side="left", padx=(8, 2))
-        entry = ttk.Entry(parent, textvariable=variable, width=6)
-        entry.pack(side="left")
-        return entry
-
-    def _text(self, parent, key: str, label: str, height: int = 2, max_lines: int | None = None) -> tk.Text:
-        title = ttk.Label(parent, text=label, style="Optional.TLabel")
-        title.pack(anchor="w")
-        self._field_labels[key] = title
-        self._ensure_flags(key)
-        widget = tk.Text(
-            parent, height=height, width=48, wrap="word", font=("Segoe UI", 10),
-            relief="solid", borderwidth=1, highlightthickness=1,
-        )
-        widget.pack(anchor="w", fill="x", pady=(0, 6))
-        self._field_inputs[key] = widget
-        self._apply_importance(key)
-        widget.bind("<KeyRelease>", lambda _e: widget.after(10, self.schedule))
-        widget.bind("<<Paste>>", lambda _e: widget.after(10, self.schedule))
-        if max_lines:
-            def block_third_line(event, box=widget, limit=max_lines):
-                if event.keysym != "Return":
-                    return None
-                current = int(box.index("end-1c").split(".")[0])
-                if current >= limit:
-                    return "break"
-                return None
-
-            def trim_extra(_event=None, box=widget, limit=max_lines):
-                end_line = int(box.index("end-1c").split(".")[0])
-                if end_line <= limit:
-                    return
-                extra = box.get(f"{limit + 1}.0", "end-1c").strip()
-                box.delete(f"{limit}.end", "end")
-                if extra:
-                    box.insert(f"{limit}.end", " " + extra)
-
-            widget.bind("<Return>", block_third_line)
-            widget.bind("<KeyRelease>", lambda _e: trim_extra(), add="+")
-            widget.bind("<<Paste>>", lambda _e: widget.after(10, trim_extra), add="+")
-        self.texts[key] = widget
-        return widget
-
-    def _checks(self, parent, keys: list[tuple[str, str]], columns: int = 2):
-        grid = ttk.Frame(parent)
-        grid.pack(fill="x", anchor="w")
-        for index, (key, label) in enumerate(keys):
-            var = tk.BooleanVar(value=False)
-            self.bools[key] = var
-            ttk.Checkbutton(grid, text=label, variable=var, command=self.schedule).grid(
-                row=index // columns, column=index % columns, sticky="w", padx=(0, 12), pady=1
-            )
-
-    def _radios(self, parent, variable: tk.StringVar, options: list[tuple[str, str]], columns: int = 2):
-        grid = ttk.Frame(parent)
-        grid.pack(fill="x", anchor="w")
-        for index, (value, label) in enumerate(options):
-            ttk.Radiobutton(
-                grid, text=label, variable=variable, value=value, command=self.schedule
-            ).grid(row=index // columns, column=index % columns, sticky="w", padx=(0, 12), pady=1)
-        return grid
-
-    def _section_kopf(self, parent):
-        self._text(
-            self._block("fachrichtung"), "fachrichtung",
-            "Fachrichtung, links oben (eine oder zwei Zeilen)",
-            height=2, max_lines=2,
-        )
-        for key, label, width in (
-            ("ihr_zeichen", "Ihr Zeichen", 18),
-            ("unser_zeichen", "Unser Zeichen", 14),
-            ("sachbearbeiter", "Sachbearbeiter", 16),
-            ("brief_datum", "Datum oben", 12),
-        ):
-            self._entry(self._block(key), key, label, width)
-
-    def _section_patient(self, parent):
-        frame = self._block("stamp_path")
-        file_row = ttk.Frame(frame)
-        file_row.pack(fill="x")
-        title = ttk.Label(file_row, text="Etikett-PDF", style="Optional.TLabel")
-        title.pack(side="left")
-        self._field_labels["stamp_path"] = title
-        self._ensure_flags("stamp_path")
-        self._apply_importance("stamp_path")
-        ttk.Entry(file_row, textvariable=self.stamp_path).pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Button(file_row, text="Wählen…", command=self.browse_stamp).pack(side="left")
-        ttk.Button(file_row, text="Entfernen", command=lambda: self.stamp_path.set("")).pack(side="left", padx=(6, 0))
-
-        mode = ttk.Frame(frame)
-        mode.pack(fill="x", pady=4)
-        ttk.Label(mode, text="Etikett").pack(side="left")
-        ttk.Radiobutton(mode, text="Originalgröße", variable=self.stamp_mode, value="native").pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(mode, text="in den Rahmen einpassen", variable=self.stamp_mode, value="fit").pack(side="left", padx=(8, 0))
-        ttk.Label(
-            frame, style="Hint.TLabel", wraplength=420,
-            text="Rechts über der roten Linie, nicht auf dem roten Text. Weißer Grund und dünner Rand, damit der Vordruck darunter nicht durchscheint.",
-        ).pack(anchor="w", pady=(2, 4))
-
-        box = ttk.Frame(frame)
-        box.pack(fill="x", pady=(0, 4))
-        ttk.Label(box, text="Rahmen mm").pack(side="left")
-        self._mm_entry(box, self.stamp_x, "X")
-        self._mm_entry(box, self.stamp_y, "Y")
-        self._mm_entry(box, self.stamp_w, "Breite")
-        self._mm_entry(box, self.stamp_h, "Höhe")
-
-        self._entry(self._block("geb_am"), "geb_am", "geb. am")
-        self._entry(self._block("station"), "station", "Station")
-        self._entry(self._block("beh_arzt"), "beh_arzt", "Beh. Arzt im Bezirkskrankenhaus", 48)
-        self._entry(self._block("tel"), "tel", "Tel.-Nr. (bei Rückfrage)", 24)
-
-    def _section_klinik(self, parent):
-        self._text(self._block("fragestellung"), "fragestellung", "Fragestellung")
-        self._text(self._block("vorbefunde"), "vorbefunde", "Wichtige Vorbefunde")
-
-    def _section_risiken(self, parent):
-        frame = self._block("infekt")
-        self._flag_line(frame, "infekt", "Infektiosität")
-        host = self._highlight_host(frame, "infekt")
-        ttk.Label(host, text="HIV, Hepatitis, Tbc, Lues").pack(anchor="w")
-        self._radios(
-            host,
-            self.infekt,
-            [("", "keine Angabe"), ("ja", "ja"), ("nein", "nein"), ("nicht", "nicht untersucht")],
-            columns=4,
-        )
-        self._entry(frame, "infekt_detail", "Bei ja, kurzer Zusatz (z. B. HIV)", 20)
-        frame = self._block("risiken")
-        self._flag_line(frame, "risiken", "Kreuze")
-        self._checks(
-            self._highlight_host(frame, "risiken"),
-            [
-                ("nuechtern", "nüchtern"),
-                ("sediert", "sediert"),
-                ("unzug", "unzug. Pat."),
-                ("epilepsie", "Epilepsie"),
-                ("nicht_gehfaehig", "nicht gehfähig"),
-                ("kommunikat", "kommunikat. gest."),
-                ("suizidal", "suizidal"),
-                ("fluchtgefahr", "Fluchtgefahr"),
-            ],
-            columns=2,
-        )
-        self._entry(self._block("risiko_etc"), "risiko_etc", "etc.", 48)
-
-    def _section_transport(self, parent):
-        frame = self._block("transport")
-        self._flag_line(frame, "transport", "Angaben")
-        host = self._highlight_host(frame, "transport")
-        self._radios(
-            host,
-            self.transport,
-            [
-                ("", "keine Angabe"),
-                ("gehend", "gehend"),
-                ("fahrdienst", "interner Fahrdienst"),
-                ("ktw", "Krankentransportwagen"),
-            ],
-            columns=2,
-        )
-        ttk.Label(host, text="Beim Krankentransportwagen").pack(anchor="w", pady=(4, 0))
-        self._radios(
-            host,
-            self.ktw_mode,
-            [("", "—"), ("liegend", "nur liegend"), ("sitzend", "sitzend transportfähig")],
-            columns=3,
-        )
-        ttk.Label(host, text="Begleitung").pack(anchor="w", pady=(4, 0))
-        self._radios(
-            host,
-            self.begleit,
-            [
-                ("", "keine Angabe"),
-                ("anz", "Begleitperson notwendig"),
-                ("nein", "nein"),
-                ("station", "Begleitung von Station"),
-            ],
-            columns=2,
-        )
-        self._entry(self._block("begleit_anz"), "begleit_anz", "Anzahl Begleitpersonen", 8)
-
-    def _section_diagnose(self, parent):
-        self._entry(self._block("diagnose"), "diagnose", "Psychiatrische Diagnose", 48)
-        self._entry(self._block("oa_name"), "oa_name", "Name Oberarzt")
-        self._entry(self._block("aa_name"), "aa_name", "Name Ass. Arzt")
-
-    def _section_abrechnung(self, parent):
-        frame = self._block("abrechnung")
-        self._flag_line(frame, "abrechnung", "Kreuze")
-        self._checks(
-            self._highlight_host(frame, "abrechnung"),
-            [
-                ("versichert", "Versichertenkarte"),
-                ("befreit", "Keine Rezeptzuzahlungspflicht — befreit"),
-                ("goae", "Bezirkskrankenhaus, GOÄ-Einfachsatz"),
-                ("bema", "Bezirkskrankenhaus, BEMA-Satz"),
-                ("hilfsmittel", "Kostenträger für Hilfsmittel stationär"),
-                ("privat", "Privatpatient"),
-            ],
-            columns=1,
-        )
-        self._entry(self._block("kasse"), "kasse", "Kasse", 40)
-        self._entry(self._block("hilfsmittel_text"), "hilfsmittel_text", "Hilfsmittel, Kostenträger", 40)
-        self._entry(self._block("privat_text"), "privat_text", "Privatpatient, Zusatz", 40)
-        self._entry(self._block("abrechnung_notiz"), "abrechnung_notiz", "Freie Zeile unter der Abrechnung", 48)
-        for key, label, width in (
-            ("termin", "Termin am", 14),
-            ("uhrzeit", "Uhrzeit", 8),
-            ("begl_person", "Begl.-Person", 18),
-            ("verw_datum", "Lohr a. Main, den", 12),
-        ):
-            self._entry(self._block(key), key, label, width)
-        self._entry(self._block("verw_name"), "verw_name", "Name Verwaltung", 32)
-
-    def _build_preview(self, parent):
-        bar = ttk.Frame(parent)
-        bar.pack(fill="x", pady=(0, 4))
-        ttk.Label(bar, text="Vorschau", style="Status.TLabel").pack(side="left")
-        ttk.Checkbutton(bar, text="Passkreuze", variable=self.show_marks).pack(side="left", padx=10)
-        ttk.Label(bar, textvariable=self.cursor_info).pack(side="right")
-
-        self.preview = tk.Canvas(parent, bg="#d5dee2", highlightthickness=0)
-        yscroll = ttk.Scrollbar(parent, orient="vertical", command=self.preview.yview)
-        self.preview.configure(yscrollcommand=yscroll.set)
-        self.preview.pack(side="left", fill="both", expand=True)
-        yscroll.pack(side="right", fill="y")
-        self.preview.bind("<Configure>", lambda _e: self.schedule())
-        self.preview.bind("<Motion>", self._on_preview_motion)
-        self.preview.bind("<Button-1>", self._on_preview_click)
-
-        def wheel(event):
-            self.preview.yview_scroll(int(-event.delta / 120), "units")
-
-        self.preview.bind("<Enter>", lambda _e: self.preview.bind_all("<MouseWheel>", wheel))
-        self.preview.bind("<Leave>", lambda _e: self.preview.unbind_all("<MouseWheel>"))
 
     def _build_printer_bar(self):
         bar = ttk.Frame(self, padding=(8, 6))
@@ -647,10 +793,70 @@ class FormApp(tk.Tk):
             "h": max(1.0, _parse_mm(self.stamp_h.get(), STAMP_DEFAULT["h"])),
         }
 
+    def _get_value(self, key: str) -> str:
+        lines = self._lines.get(key)
+        if lines:
+            parts = [entry.get().replace("\n", " ") for entry in lines]
+            while parts and not parts[-1].strip():
+                parts.pop()
+            if not any(part.strip() for part in parts):
+                return ""
+            return "\n".join(part.strip() for part in parts)
+        widget = self._field_inputs.get(key)
+        if isinstance(widget, tk.Text):
+            return widget.get("1.0", "end-1c")
+        if isinstance(widget, tk.Entry):
+            return widget.get()
+        return ""
+
+    def _set_value(self, key: str, value: str):
+        value = "" if value is None else str(value)
+        lines = self._lines.get(key)
+        if lines:
+            self._fill_lines(key, lines, value)
+            return
+        widget = self._field_inputs.get(key)
+        if isinstance(widget, tk.Text):
+            widget.delete("1.0", "end")
+            if value:
+                widget.insert("1.0", value)
+            widget.tag_add("center", "1.0", "end")
+            return
+        if isinstance(widget, tk.Entry):
+            widget.delete(0, "end")
+            if value:
+                widget.insert(0, value)
+            self._paint_overflow(widget)
+
+    def _fill_lines(self, key: str, entries: list[tk.Entry], value: str):
+        raw = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not raw:
+            parts: list[str] = []
+        elif "\n" in raw:
+            parts = raw.split("\n")
+        else:
+            parts = self._wrap_field(key, raw)
+        if len(parts) > len(entries):
+            parts = parts[: len(entries) - 1] + [" ".join(parts[len(entries) - 1 :])]
+        for index, entry in enumerate(entries):
+            entry.delete(0, "end")
+            if index < len(parts) and parts[index]:
+                entry.insert(0, parts[index])
+            self._paint_overflow(entry)
+
+    def _wrap_field(self, key: str, text: str) -> list[str]:
+        spec = TEXT_FIELDS[key]
+        line_specs = spec["lines"]
+        pt = float(spec.get("size") or line_specs[0]["size"]) * self._ink_factor()
+        dpi = 300.0
+        widths = [max(1, overlay.mm_to_px(line["w"], dpi)) for line in line_specs]
+        if self._wrap_draw is None:
+            image = Image.new("RGB", (8, 8))
+            self._wrap_draw = ImageDraw.Draw(image)
+        return list(overlay._wrap(self._wrap_draw, text, widths, pt, dpi))
+
     def _values_and_checks(self) -> tuple[dict[str, str], dict[str, bool]]:
-        values = {key: var.get() for key, var in self.entries.items()}
-        for key, widget in self.texts.items():
-            values[key] = widget.get("1.0", "end-1c")
+        values = {key: self._get_value(key) for key in TEXT_FIELDS}
         checks = {key: var.get() for key, var in self.bools.items()}
         infekt = self.infekt.get()
         checks["infekt_ja"] = infekt == "ja"
@@ -699,8 +905,10 @@ class FormApp(tk.Tk):
             values, checks = self._values_and_checks()
             box = self._stamp_box()
             align = "bottomright"
+            # While the boxes are on the page they are the text. Passkreuze hides
+            # them and draws the answers into the picture, same as the print.
             image = overlay.compose_preview(
-                values,
+                values if self.show_marks.get() else {},
                 checks,
                 PREVIEW_DPI,
                 self._current_stamp(PREVIEW_DPI),
@@ -708,43 +916,96 @@ class FormApp(tk.Tk):
                 self.show_marks.get(),
                 form_page=self._form_page,
                 stamp_align=align,
+                ink_scale=self._ink_factor(),
             )
         except Exception as exc:
             self.cursor_info.set(f"Vorschau: {exc}")
             return
 
-        width = self.preview.winfo_width() - 4
-        if width < 80:
-            width = 640
-        scale = width / image.width
-        display = image.resize((width, max(1, int(round(image.height * scale)))), Image.Resampling.BILINEAR)
+        margin = 28
+        view_w = self.preview.winfo_width()
+        view_h = self.preview.winfo_height()
+        if view_w < 80:
+            view_w = 900
+        if view_h < 80:
+            view_h = 700
+        fit = min(
+            (view_w - margin * 2) / image.width,
+            (view_h - margin * 2) / image.height,
+        )
+        scale = max(0.2, fit * (self._zoom / 100.0))
+        display_w = max(1, int(round(image.width * scale)))
+        display_h = max(1, int(round(image.height * scale)))
+        display = image.resize((display_w, display_h), Image.Resampling.BILINEAR)
         self._preview_scale = scale
+        self._page_ox = max(margin, (view_w - display_w) / 2)
+        self._page_oy = max(margin, (view_h - display_h) / 2)
         self._photo = ImageTk.PhotoImage(display.convert("RGB"))
-        self.preview.delete("all")
-        self.preview.create_image(0, 0, image=self._photo, anchor="nw")
-        self.preview.configure(scrollregion=(0, 0, display.width, display.height))
+        if self._image_id is None:
+            self._image_id = self.preview.create_image(
+                self._page_ox, self._page_oy, image=self._photo, anchor="nw", tags="page",
+            )
+        else:
+            self.preview.itemconfig(self._image_id, image=self._photo)
+            self.preview.coords(self._image_id, self._page_ox, self._page_oy)
+        self.preview.tag_lower(self._image_id)
+        self.preview.configure(scrollregion=(
+            0, 0,
+            max(view_w, display_w + margin * 2),
+            max(view_h, display_h + margin * 2),
+        ))
+        self._layout_fields()
 
     def _event_mm(self, event) -> tuple[float, float] | None:
         if self._preview_scale <= 0:
             return None
-        x = self.preview.canvasx(event.x) / self._preview_scale
-        y = self.preview.canvasy(event.y) / self._preview_scale
-        return x / PREVIEW_DPI * 25.4, y / PREVIEW_DPI * 25.4
+        x = self.preview.canvasx(event.x) - self._page_ox
+        y = self.preview.canvasy(event.y) - self._page_oy
+        if x < 0 or y < 0:
+            return None
+        return x / self._preview_scale / PREVIEW_DPI * 25.4, y / self._preview_scale / PREVIEW_DPI * 25.4
 
     def _on_preview_motion(self, event):
         point = self._event_mm(event)
         if point is None:
             return
-        self.cursor_info.set(f"{point[0]:.1f} mm  ·  {point[1]:.1f} mm    Umschalt+Klick setzt die Etikett-Ecke")
+        mark = self._nearest_mark(*point)
+        if mark and self._hover_id is not None:
+            cx, cy = CHECKS[mark]
+            radius = self._px(CHECK_HIT_MM)
+            x = self._page_ox + self._px(cx)
+            y = self._page_oy + self._px(cy)
+            self.preview.coords(self._hover_id, x - radius, y - radius, x + radius, y + radius)
+            self.preview.itemconfigure(self._hover_id, state="normal")
+            self.preview.tag_raise(self._hover_id)
+            self.preview.tag_raise("field")
+            self.preview.configure(cursor="hand2")
+        else:
+            if self._hover_id is not None:
+                self.preview.itemconfigure(self._hover_id, state="hidden")
+            self.preview.configure(cursor="")
+        self.cursor_info.set(
+            f"{point[0]:.1f} mm  ·  {point[1]:.1f} mm    Kreis anklicken · Umschalt+Klick Etikett-Ecke"
+        )
 
     def _on_preview_click(self, event):
-        if not (event.state & 0x0001):
-            return
         point = self._event_mm(event)
         if point is None:
             return
-        self.stamp_x.set(f"{point[0]:.1f}")
-        self.stamp_y.set(f"{point[1]:.1f}")
+        if event.state & 0x0001:
+            self.stamp_x.set(f"{point[0]:.1f}")
+            self.stamp_y.set(f"{point[1]:.1f}")
+            return
+        mark = self._nearest_mark(*point)
+        if mark:
+            self._toggle_mark(mark)
+
+    def _on_preview_double(self, event):
+        if event.state & 0x0001:
+            return
+        point = self._event_mm(event)
+        if point and self._point_in_stamp(*point):
+            self.browse_stamp()
 
     def _refresh_printers(self):
         try:
@@ -819,16 +1080,9 @@ class FormApp(tk.Tk):
             "vorbefunde": "CT Schädel 2024 ohne pathologischen Befund. Vorbestehende Angststörung.",
         }
         for key, value in sample.items():
-            if key in self.entries:
-                self.entries[key].set(value)
-            elif key in self.texts:
-                widget = self.texts[key]
-                widget.delete("1.0", "end")
-                widget.insert("1.0", value)
+            self._set_value(key, value)
         for key, value in long.items():
-            widget = self.texts[key]
-            widget.delete("1.0", "end")
-            widget.insert("1.0", value)
+            self._set_value(key, value)
         self.infekt.set("ja")
         self.transport.set("ktw")
         self.ktw_mode.set("sitzend")
@@ -839,14 +1093,10 @@ class FormApp(tk.Tk):
         self.schedule()
 
     def clear_fields(self):
-        for key, var in self.entries.items():
+        for key in TEXT_FIELDS:
             if self._kept(key):
                 continue
-            var.set(_today() if key in DATE_KEYS else "")
-        for key, widget in self.texts.items():
-            if self._kept(key):
-                continue
-            widget.delete("1.0", "end")
+            self._set_value(key, "")
         if not self._kept("risiken"):
             for key in RISK_KEYS:
                 if key in self.bools:
@@ -884,15 +1134,22 @@ class FormApp(tk.Tk):
             "bools": {key: var.get() for key, var in self.bools.items()},
             "important": {key: var.get() for key, var in self.important.items()},
             "remember": {key: var.get() for key, var in self.remember.items()},
+            "zoom": self._zoom,
+            "ink": self._ink,
         }
 
     def _apply_payload(self, data: dict, only_remembered: bool = False):
         self._ready = False
-        self._suspend_layout = True
         try:
             for key in ("printer", "copies", "shift_x", "shift_y", "stamp_mode"):
                 if key in data and data[key] is not None:
                     getattr(self, key).set(str(data[key]))
+            if "zoom" in data:
+                self._zoom = max(50, min(250, int(float(data["zoom"]))))
+                self.zoom_pct.set(f"{self._zoom} %")
+            if "ink" in data:
+                self._ink = max(100, min(200, int(float(data["ink"]))))
+                self.ink_pct.set(f"{self._ink} %")
             box = data.get("stamp_box") or {}
             for key, var in (("x", self.stamp_x), ("y", self.stamp_y), ("w", self.stamp_w), ("h", self.stamp_h)):
                 if key in box:
@@ -911,13 +1168,9 @@ class FormApp(tk.Tk):
             if "stamp_path" in data and keep("stamp_path"):
                 self.stamp_path.set(str(data["stamp_path"] or ""))
             values = data.get("values") or {}
-            for key, var in self.entries.items():
+            for key in TEXT_FIELDS:
                 if key in values and keep(key):
-                    var.set(str(values[key]))
-            for key, widget in self.texts.items():
-                if key in values and keep(key):
-                    widget.delete("1.0", "end")
-                    widget.insert("1.0", str(values[key]))
+                    self._set_value(key, str(values[key]))
             bools = data.get("bools") or {}
             for key, var in self.bools.items():
                 if key not in bools:
@@ -933,15 +1186,9 @@ class FormApp(tk.Tk):
                 for key in ("transport", "ktw_mode", "begleit"):
                     if key in data:
                         getattr(self, key).set(str(data[key]))
-            if only_remembered:
-                for key in DATE_KEYS:
-                    if not self._kept(key) and key in self.entries:
-                        self.entries[key].set(_today())
             self._apply_all_importance()
         finally:
             self._ready = True
-            self._suspend_layout = False
-        self._place_blocks()
         self.schedule()
 
     def save_dialog(self):
@@ -1003,8 +1250,6 @@ class FormApp(tk.Tk):
             pass
 
     def _load_config(self):
-        self.entries["brief_datum"].set(_today())
-        self.entries["verw_datum"].set(_today())
         if not CONFIG_PATH.exists():
             return
         try:
@@ -1078,6 +1323,7 @@ class FormApp(tk.Tk):
                 stamp_align=align,
                 registration=registration,
                 transparent=False,
+                ink_scale=max(1.0, min(2.0, float(payload.get("ink", 100)) / 100.0)),
             )
             if registration:
                 shift_x = _parse_mm(payload["shift_x"], 0.0)
