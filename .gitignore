@@ -2,6 +2,7 @@ __pycache__/
 build/
 dist/
 config.json
+konsile/
 _qa_*.png
 _form_*.png
 _crop_*.png

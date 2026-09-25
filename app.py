@@ -10,9 +10,9 @@ import json
 import sys
 import threading
 import tkinter as tk
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
-from tkinter import filedialog, font as tkfont, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
@@ -20,6 +20,12 @@ import gdi_print
 import overlay
 from form_layout import CHECKS, STAMP_DEFAULT, TEXT_FIELDS
 from overlay import mm_to_px
+
+def _safe_stem(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in " _-." else " " for ch in name)
+    cleaned = " ".join(cleaned.split()).strip(" .")
+    return cleaned[:80] or "Konsil"
+
 
 def _install_dir() -> Path:
     """Folder the user runs. Settings stay beside the exe."""
@@ -30,6 +36,7 @@ def _install_dir() -> Path:
 
 ROOT = _install_dir()
 CONFIG_PATH = ROOT / "config.json"
+KONSIL_DIR = ROOT / "konsile"
 PREVIEW_DPI = 120
 
 # Filled on almost every form. Highlighted until the user turns that off.
@@ -182,9 +189,14 @@ class FormApp(tk.Tk):
         self.transport = tk.StringVar(value="")
         self.ktw_mode = tk.StringVar(value="")
         self.begleit = tk.StringVar(value="")
+        self._konsil_file: Path | None = None
+        self._konsil_name = ""
+        self._snapshot = ""
 
         self._build()
         self._load_config()
+        self._snapshot = self._form_snapshot()
+        self._refresh_title()
         self._refresh_printers()
         self._ready = True
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -246,7 +258,9 @@ class FormApp(tk.Tk):
         ttk.Button(row, text="Felder…", command=self.open_field_settings).pack(side="left", padx=(0, 4))
         ttk.Button(row, text="Beispiel füllen", command=self.fill_example).pack(side="left", padx=4)
         ttk.Button(row, text="Nicht gemerkte leeren", command=self.clear_fields).pack(side="left", padx=4)
-        ttk.Button(row, text="Speichern…", command=self.save_dialog).pack(side="left", padx=4)
+        ttk.Button(row, text="Neu", command=self.new_konsil).pack(side="left", padx=4)
+        ttk.Button(row, text="Speichern", command=self.save_konsil).pack(side="left", padx=4)
+        ttk.Button(row, text="Speichern unter…", command=lambda: self.save_konsil(save_as=True)).pack(side="left", padx=4)
         ttk.Button(row, text="Öffnen…", command=self.open_dialog).pack(side="left", padx=4)
         ttk.Checkbutton(row, text="Passkreuze", variable=self.show_marks).pack(side="left", padx=(12, 4))
         view = ttk.Frame(row)
@@ -783,7 +797,12 @@ class FormApp(tk.Tk):
             return
         if self._after_id is not None:
             self.after_cancel(self._after_id)
-        self._after_id = self.after(90, self.refresh_preview)
+        self._after_id = self.after(90, self._refresh_soon)
+
+    def _refresh_soon(self):
+        self._after_id = None
+        self.refresh_preview()
+        self._refresh_title()
 
     def _stamp_box(self) -> dict:
         return {
@@ -1191,31 +1210,194 @@ class FormApp(tk.Tk):
             self._ready = True
         self.schedule()
 
-    def save_dialog(self):
-        path = filedialog.asksaveasfilename(
-            title="Formular speichern",
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
-            initialdir=str(ROOT),
-        )
-        if not path:
+    def _form_snapshot(self) -> str:
+        return json.dumps(self._payload(), ensure_ascii=False, sort_keys=True)
+
+    def _is_dirty(self) -> bool:
+        return self._form_snapshot() != self._snapshot
+
+    def _refresh_title(self):
+        name = self._konsil_name or "Neues Konsil"
+        mark = " *" if self._is_dirty() else ""
+        self.title(f"Konsil — {name}{mark}")
+
+    def _suggest_name(self) -> str:
+        values, _checks = self._values_and_checks()
+        parts = [
+            values.get("fachrichtung", "").replace("\n", " ").strip(),
+            values.get("geb_am", "").strip(),
+            values.get("station", "").strip(),
+        ]
+        parts = [part for part in parts if part]
+        if parts:
+            return " ".join(parts)[:60]
+        return date.today().strftime("Konsil %d.%m.%Y")
+
+    def _confirm_discard(self) -> bool:
+        if not self._is_dirty():
+            return True
+        answer = messagebox.askyesnocancel("Konsil", "Änderungen an diesem Konsil speichern?")
+        if answer is None:
+            return False
+        if answer:
+            return self.save_konsil()
+        return True
+
+    def new_konsil(self):
+        if not self._confirm_discard():
             return
-        Path(path).write_text(json.dumps(self._payload(), ensure_ascii=False, indent=2), encoding="utf-8")
+        self._konsil_file = None
+        self._konsil_name = ""
+        self.clear_fields()
+        self._snapshot = self._form_snapshot()
+        self._refresh_title()
+
+    def save_konsil(self, save_as: bool = False) -> bool:
+        try:
+            KONSIL_DIR.mkdir(exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Speichern", str(exc))
+            return False
+        if self._konsil_file is not None and not save_as:
+            path = self._konsil_file
+            name = self._konsil_name or path.stem
+        else:
+            name = simpledialog.askstring(
+                "Konsil speichern",
+                "Name für dieses Konsil:",
+                initialvalue=self._konsil_name or self._suggest_name(),
+                parent=self,
+            )
+            if name is None:
+                return False
+            name = " ".join(name.split())
+            if not name:
+                return False
+            path = KONSIL_DIR / f"{_safe_stem(name)}.json"
+            if self._konsil_file is None or path.resolve() != self._konsil_file.resolve():
+                if path.exists() and not messagebox.askyesno(
+                    "Konsil speichern",
+                    f"„{name}“ gibt es schon. Ersetzen?",
+                ):
+                    return False
+        payload = self._payload()
+        payload["name"] = name
+        payload["saved_at"] = datetime.now().isoformat(timespec="minutes")
+        try:
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Speichern", str(exc))
+            return False
+        self._konsil_file = path
+        self._konsil_name = name
+        self._snapshot = self._form_snapshot()
+        self._refresh_title()
+        return True
 
     def open_dialog(self):
-        path = filedialog.askopenfilename(
-            title="Formular öffnen",
-            filetypes=[("JSON", "*.json")],
-            initialdir=str(ROOT),
-        )
-        if not path:
+        try:
+            KONSIL_DIR.mkdir(exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Öffnen", str(exc))
+            return
+        files = sorted(KONSIL_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        win = tk.Toplevel(self)
+        win.title("Konsil öffnen")
+        win.transient(self)
+        win.grab_set()
+        win.geometry("520x360")
+        ttk.Label(win, text="Gespeicherte Konsile").pack(anchor="w", padx=12, pady=(12, 4))
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=12)
+        scroll = ttk.Scrollbar(frame)
+        scroll.pack(side="right", fill="y")
+        box = tk.Listbox(frame, yscrollcommand=scroll.set, font=("Segoe UI", 11), activestyle="dotbox")
+        box.pack(side="left", fill="both", expand=True)
+        scroll.configure(command=box.yview)
+        labels: list[Path] = []
+        for path in files:
+            label = path.stem
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("name"):
+                    label = str(data["name"])
+            except (OSError, json.JSONDecodeError):
+                pass
+            when = datetime.fromtimestamp(path.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
+            box.insert("end", f"{label}    {when}")
+            labels.append(path)
+        if labels:
+            box.selection_set(0)
+            box.activate(0)
+        else:
+            box.insert("end", "Noch nichts gespeichert.")
+            box.configure(state="disabled")
+
+        def selected() -> tuple[int, Path] | None:
+            if not labels:
+                return None
+            picked = box.curselection()
+            if not picked:
+                return None
+            return picked[0], labels[picked[0]]
+
+        def do_open(_event=None):
+            choice = selected()
+            if choice is None:
+                return
+            _index, path = choice
+            win.destroy()
+            self._open_konsil(path)
+
+        def do_delete():
+            choice = selected()
+            if choice is None:
+                return
+            index, path = choice
+            label = box.get(index).rsplit("    ", 1)[0]
+            if not messagebox.askyesno("Löschen", f"„{label}“ löschen?", parent=win):
+                return
+            try:
+                path.unlink()
+            except OSError as exc:
+                messagebox.showerror("Löschen", str(exc), parent=win)
+                return
+            if self._konsil_file is not None and path.resolve() == self._konsil_file.resolve():
+                self._konsil_file = None
+                self._snapshot = ""
+                self._refresh_title()
+            box.delete(index)
+            del labels[index]
+            if not labels:
+                box.configure(state="normal")
+                box.insert("end", "Noch nichts gespeichert.")
+                box.configure(state="disabled")
+
+        box.bind("<Double-Button-1>", do_open)
+        box.bind("<Return>", do_open)
+        buttons = ttk.Frame(win)
+        buttons.pack(fill="x", padx=12, pady=12)
+        ttk.Button(buttons, text="Öffnen", command=do_open).pack(side="left")
+        ttk.Button(buttons, text="Löschen", command=do_delete).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Schließen", command=win.destroy).pack(side="right")
+        win.wait_window()
+
+    def _open_konsil(self, path: Path):
+        if not self._confirm_discard():
             return
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             messagebox.showerror("Öffnen", str(exc))
             return
+        if not isinstance(data, dict):
+            messagebox.showerror("Öffnen", "Diese Datei ist kein Konsil.")
+            return
         self._apply_payload(data)
+        self._konsil_file = path
+        self._konsil_name = str(data.get("name") or path.stem)
+        self._snapshot = self._form_snapshot()
+        self._refresh_title()
 
     def _config_payload(self) -> dict:
         """Only the fields marked Merken are kept for the next start."""
@@ -1259,6 +1441,8 @@ class FormApp(tk.Tk):
         self._apply_payload(data, only_remembered=True)
 
     def _on_close(self):
+        if not self._confirm_discard():
+            return
         self._save_config()
         self.destroy()
 
