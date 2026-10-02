@@ -10,7 +10,10 @@ a = Analysis(
     ["app.py"],
     pathex=[],
     binaries=pdfium_binaries + raw_binaries,
-    datas=[("Konsil_Formular_empty.pdf", ".")] + pdfium_datas + raw_datas,
+    datas=[
+        ("Konsil_Formular_empty.pdf", "."),
+        ("Unterschrift.png", "."),
+    ] + pdfium_datas + raw_datas,
     hiddenimports=[
         "win32print",
         "win32ui",

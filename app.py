@@ -20,6 +20,7 @@ import gdi_print
 import overlay
 from form_layout import CHECKS, STAMP_DEFAULT, TEXT_FIELDS
 from overlay import mm_to_px
+from stations import filter_stations, match_station
 
 def _safe_stem(name: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in " _-." else " " for ch in name)
@@ -47,7 +48,7 @@ IMPORTANT_DEFAULT = {
 # Same from one form to the next. Restored on the next start.
 REMEMBER_DEFAULT = {
     "fachrichtung", "station", "sachbearbeiter", "beh_arzt", "tel",
-    "oa_name", "aa_name", "verw_name",
+    "oa_name", "verw_name",
 }
 RISK_KEYS = (
     "nuechtern", "sediert", "unzug", "epilepsie",
@@ -70,7 +71,7 @@ FIELD_ORDER = (
     "infekt", "infekt_detail",
     "risiken", "risiko_etc",
     "transport", "begleit_anz",
-    "diagnose", "oa_name", "aa_name",
+    "diagnose", "oa_name",
     "abrechnung", "kasse", "hilfsmittel_text", "privat_text", "abrechnung_notiz",
     "termin", "uhrzeit", "begl_person", "verw_datum", "verw_name",
 )
@@ -95,7 +96,6 @@ CAPTIONS = {
     "begleit_anz": "Anzahl Begleitpersonen",
     "diagnose": "Psychiatrische Diagnose",
     "oa_name": "Name Oberarzt",
-    "aa_name": "Name Ass. Arzt",
     "abrechnung": "Kreuze, Abrechnung",
     "kasse": "Kasse",
     "hilfsmittel_text": "Hilfsmittel, Kostenträger",
@@ -133,6 +133,194 @@ def _font(size: int):
     if path.exists():
         return ImageFont.truetype(str(path), size)
     return ImageFont.load_default()
+
+
+class StationEntry(tk.Entry):
+    """Type-to-search station list. Picking a ward fills its Durchwahl."""
+
+    def __init__(self, master, on_pick):
+        super().__init__(
+            master,
+            font=("Arial", 10),
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            bg="#fffef8",
+            fg="#142028",
+            highlightbackground="#c5d0d6",
+            highlightcolor="#1a6f8a",
+            insertbackground="#142028",
+            selectbackground="#1a6f8a",
+            selectforeground="white",
+        )
+        self.on_pick = on_pick
+        self._rows: list[tuple[str, str]] = []
+        self._applied = ""
+        self._popup: tk.Toplevel | None = None
+        self._list: tk.Listbox | None = None
+        self.bind("<KeyRelease>", self._on_key, add="+")
+        self.bind("<Down>", self._on_down, add="+")
+        self.bind("<Up>", self._on_up, add="+")
+        self.bind("<Return>", self._on_return, add="+")
+        self.bind("<Escape>", self._on_escape, add="+")
+        self.bind("<FocusOut>", self._on_focus_out, add="+")
+        self.bind("<Button-1>", self._on_click, add="+")
+
+    def _ensure_popup(self):
+        if self._popup is not None:
+            return
+        popup = tk.Toplevel(self)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        try:
+            popup.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        listing = tk.Listbox(
+            popup,
+            font=("Arial", 10),
+            activestyle="dotbox",
+            bg="#fffef8",
+            fg="#142028",
+            selectbackground="#1a6f8a",
+            selectforeground="white",
+            highlightthickness=1,
+            highlightbackground="#1a6f8a",
+            relief="flat",
+            exportselection=False,
+        )
+        listing.pack(fill="both", expand=True)
+        listing.bind("<ButtonRelease-1>", self._on_list_click)
+        listing.bind("<Return>", self._on_return)
+        self._popup = popup
+        self._list = listing
+
+    def accept_loaded(self):
+        """Remember the station already on the form so a saved phone is kept."""
+        self._applied = self.get().strip().casefold()
+        self._hide()
+
+    def _popup_open(self) -> bool:
+        if self._popup is None:
+            return False
+        try:
+            return bool(self._popup.winfo_viewable())
+        except tk.TclError:
+            return False
+
+    def _hide(self):
+        if self._popup is not None:
+            self._popup.withdraw()
+
+    def _on_click(self, _event):
+        self.after_idle(self._show)
+
+    def _on_key(self, event):
+        if event.keysym in {
+            "Up", "Down", "Return", "Escape", "Tab", "ISO_Left_Tab",
+            "Shift_L", "Shift_R", "Left", "Right", "Home", "End",
+        }:
+            return
+        self.after_idle(self._show)
+
+    def _on_down(self, _event):
+        if not self._popup_open():
+            self._show()
+            return "break"
+        self._move(1)
+        return "break"
+
+    def _on_up(self, _event):
+        if not self._popup_open():
+            return "break"
+        self._move(-1)
+        return "break"
+
+    def _on_escape(self, _event):
+        self._hide()
+        return "break"
+
+    def _on_return(self, _event):
+        if self._popup_open() and self._rows and self._list is not None:
+            picked = self._list.curselection()
+            self._choose(picked[0] if picked else 0)
+            return "break"
+        found = match_station(self.get())
+        if found:
+            self._apply(found[0], found[1], focus_phone=True)
+        return "break"
+
+    def _on_focus_out(self, _event):
+        self.after(160, self._after_focus)
+
+    def _after_focus(self):
+        focus = self.focus_get()
+        if self._list is not None and focus is self._list:
+            return
+        self._hide()
+        found = match_station(self.get())
+        if found and found[0].casefold() != self._applied:
+            self._apply(found[0], found[1], focus_phone=False)
+
+    def _on_list_click(self, _event):
+        if self._list is None:
+            return
+        picked = self._list.curselection()
+        if picked:
+            self._choose(picked[0])
+
+    def _move(self, step: int):
+        if self._list is None or not self._rows:
+            return
+        picked = self._list.curselection()
+        index = picked[0] if picked else -1
+        index = max(0, min(len(self._rows) - 1, index + step))
+        self._list.selection_clear(0, "end")
+        self._list.selection_set(index)
+        self._list.activate(index)
+        self._list.see(index)
+
+    def _show(self):
+        if not self.winfo_viewable():
+            return
+        self._ensure_popup()
+        assert self._list is not None and self._popup is not None
+        self._rows = filter_stations(self.get())
+        self._list.delete(0, "end")
+        if not self._rows:
+            self._hide()
+            return
+        for label, phone in self._rows:
+            self._list.insert("end", f"{label}    {phone}")
+        self._list.configure(height=min(8, len(self._rows)))
+        self._list.selection_clear(0, "end")
+        self._list.selection_set(0)
+        self._list.activate(0)
+        self.update_idletasks()
+        width = max(self.winfo_width(), 168)
+        height = self._list.winfo_reqheight() + 2
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height()
+        screen_h = self.winfo_screenheight()
+        if y + height > screen_h - 8:
+            y = max(0, self.winfo_rooty() - height)
+        self._popup.geometry(f"{width}x{height}+{x}+{y}")
+        self._popup.deiconify()
+        self._popup.lift()
+
+    def _choose(self, index: int):
+        if index < 0 or index >= len(self._rows):
+            return
+        label, phone = self._rows[index]
+        self._apply(label, phone, focus_phone=True)
+        self._hide()
+
+    def _apply(self, label: str, phone: str, focus_phone: bool):
+        self._applied = label.casefold()
+        if self.get() != label:
+            self.delete(0, "end")
+            self.insert(0, label)
+        self.on_pick(label, phone, focus_phone)
 
 
 class FormApp(tk.Tk):
@@ -340,6 +528,11 @@ class FormApp(tk.Tk):
                 self._field_inputs[key] = widget
                 self._remember_field(widget, newline=True)
                 self._limit_lines(widget, 2)
+            elif key == "station":
+                widget = StationEntry(self.preview, self._station_chosen)
+                self._field_inputs[key] = widget
+                self._embed(widget)
+                self._remember_field(widget)
             else:
                 widget = self._make_entry()
                 self._field_inputs[key] = widget
@@ -448,6 +641,9 @@ class FormApp(tk.Tk):
         widget.bind("<<Paste>>", lambda _e: widget.after(10, trim_extra), add="+")
 
     def _wheel(self, event):
+        station = self._field_inputs.get("station")
+        if isinstance(station, StationEntry):
+            station._hide()
         if event.state & 0x0004:
             self._bump_zoom(10 if event.delta > 0 else -10)
             return "break"
@@ -683,6 +879,21 @@ class FormApp(tk.Tk):
     def _point_in_stamp(self, x_mm: float, y_mm: float) -> bool:
         box = self._stamp_box()
         return box["x"] <= x_mm <= box["x"] + box["w"] and box["y"] <= y_mm <= box["y"] + box["h"]
+
+    def _station_chosen(self, _label: str, phone: str, focus_phone: bool = False):
+        self._set_value("tel", phone)
+        if focus_phone:
+            tel = self._field_inputs.get("tel")
+            if isinstance(tel, tk.Entry):
+                tel.focus_set()
+                tel.selection_range(0, "end")
+                tel.icursor("end")
+        self.schedule()
+
+    def _note_station(self):
+        station = self._field_inputs.get("station")
+        if isinstance(station, StationEntry):
+            station.accept_loaded()
 
     def _ensure_flags(self, key: str):
         if key in self.important:
@@ -1082,7 +1293,6 @@ class FormApp(tk.Tk):
             "risiko_etc": "Alkohol",
             "diagnose": "Mittelgradige depressive Episode",
             "oa_name": "Dr. Keller",
-            "aa_name": "Dr. Novak",
             "kasse": "AOK Bayern",
             "hilfsmittel_text": "Brille",
             "privat_text": "",
@@ -1109,6 +1319,7 @@ class FormApp(tk.Tk):
         for key in ("nuechtern", "suizidal", "versichert", "goae"):
             if key in self.bools:
                 self.bools[key].set(True)
+        self._note_station()
         self.schedule()
 
     def clear_fields(self):
@@ -1132,6 +1343,7 @@ class FormApp(tk.Tk):
             self.begleit.set("")
         if not self._kept("stamp_path"):
             self.stamp_path.set("")
+        self._note_station()
         self.schedule()
 
     def _payload(self) -> dict:
@@ -1206,6 +1418,7 @@ class FormApp(tk.Tk):
                     if key in data:
                         getattr(self, key).set(str(data[key]))
             self._apply_all_importance()
+            self._note_station()
         finally:
             self._ready = True
         self.schedule()
@@ -1305,81 +1518,256 @@ class FormApp(tk.Tk):
         win.title("Konsil öffnen")
         win.transient(self)
         win.grab_set()
-        win.geometry("520x360")
-        ttk.Label(win, text="Gespeicherte Konsile").pack(anchor="w", padx=12, pady=(12, 4))
+        win.geometry("560x460")
+        win.minsize(440, 340)
+        ttk.Label(win, text="Gespeicherte Konsile").pack(anchor="w", padx=12, pady=(12, 0))
+        ttk.Label(
+            win,
+            style="Hint.TLabel",
+            text="Ankreuzen, was in einen Druckauftrag soll. Doppelklick öffnet ein Konsil.",
+        ).pack(anchor="w", padx=12, pady=(2, 6))
+
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True, padx=12)
-        scroll = ttk.Scrollbar(frame)
+        canvas = tk.Canvas(frame, highlightthickness=0, bg="white", bd=0)
+        scroll = ttk.Scrollbar(frame, command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
-        box = tk.Listbox(frame, yscrollcommand=scroll.set, font=("Segoe UI", 11), activestyle="dotbox")
-        box.pack(side="left", fill="both", expand=True)
-        scroll.configure(command=box.yview)
-        labels: list[Path] = []
-        for path in files:
-            label = path.stem
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and data.get("name"):
-                    label = str(data["name"])
-            except (OSError, json.JSONDecodeError):
-                pass
-            when = datetime.fromtimestamp(path.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
-            box.insert("end", f"{label}    {when}")
-            labels.append(path)
-        if labels:
-            box.selection_set(0)
-            box.activate(0)
-        else:
-            box.insert("end", "Noch nichts gespeichert.")
-            box.configure(state="disabled")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg="white")
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
 
-        def selected() -> tuple[int, Path] | None:
-            if not labels:
-                return None
-            picked = box.curselection()
-            if not picked:
-                return None
-            return picked[0], labels[picked[0]]
+        def fit_inner(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 0, 0))
+            if event is None or event.widget is canvas:
+                width = canvas.winfo_width()
+                if width > 1:
+                    canvas.itemconfigure(window_id, width=width)
 
-        def do_open(_event=None):
-            choice = selected()
-            if choice is None:
+        inner.bind("<Configure>", fit_inner)
+        canvas.bind("<Configure>", fit_inner)
+
+        def on_wheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
+
+        entries: list[dict] = []
+        selected = {"index": 0}
+
+        def paint_selection():
+            for index, entry in enumerate(entries):
+                bg = "#d6eef4" if index == selected["index"] else "white"
+                entry["row"].configure(bg=bg)
+                entry["name"].configure(bg=bg)
+
+        def select(index: int):
+            if not entries:
                 return
-            _index, path = choice
+            selected["index"] = max(0, min(index, len(entries) - 1))
+            paint_selection()
+            canvas.focus_set()
+
+        def build_rows(prefer: int = 0):
+            previous = {entry["path"]: entry["var"].get() for entry in entries}
+            for child in inner.winfo_children():
+                child.destroy()
+            entries.clear()
+            empty_label = None
+            if not files:
+                tk.Label(
+                    inner,
+                    text="Noch nichts gespeichert.",
+                    bg="white",
+                    fg="#5c6b73",
+                    font=("Segoe UI", 11),
+                ).pack(anchor="w", padx=8, pady=8)
+                refresh_caption()
+                return
+            for index, path in enumerate(files):
+                label = path.stem
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict) and data.get("name"):
+                        label = str(data["name"])
+                except (OSError, json.JSONDecodeError):
+                    data = None
+                when = datetime.fromtimestamp(path.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
+                row = tk.Frame(inner, bg="white")
+                row.pack(fill="x")
+                var = tk.BooleanVar(value=previous.get(path, False))
+                var.trace_add("write", lambda *_: refresh_caption())
+                box = ttk.Checkbutton(row, variable=var, command=lambda i=index: select(i))
+                box.pack(side="left", padx=(6, 2), pady=2)
+                name = tk.Label(
+                    row,
+                    text=f"{label}    {when}",
+                    anchor="w",
+                    bg="white",
+                    font=("Segoe UI", 11),
+                )
+                name.pack(side="left", fill="x", expand=True, padx=(2, 8), pady=3)
+                entry = {"path": path, "var": var, "row": row, "name": name, "title": label, "data": data}
+                entries.append(entry)
+
+                def bind_row(widget, item=index):
+                    widget.bind("<Button-1>", lambda _e, i=item: select(i))
+                    widget.bind("<Double-Button-1>", lambda _e, i=item: do_open_index(i))
+                    widget.bind("<MouseWheel>", on_wheel)
+
+                bind_row(row)
+                bind_row(name)
+                box.bind("<MouseWheel>", on_wheel)
+            select(prefer)
+            refresh_caption()
+            canvas.after_idle(fit_inner)
+
+        canvas.bind("<MouseWheel>", on_wheel)
+
+        three = tk.BooleanVar(value=True)
+        options = ttk.Frame(win)
+        options.pack(fill="x", padx=12, pady=(8, 0))
+        ttk.Checkbutton(options, text="3 von jedem", variable=three).pack(anchor="w")
+        batch_hint = ttk.Label(options, style="Hint.TLabel", wraplength=500)
+        batch_hint.pack(anchor="w", pady=(2, 0))
+
+        def refresh_caption():
+            picked = sum(1 for entry in entries if entry["var"].get())
+            each = 3 if three.get() else 1
+            if picked:
+                print_btn.configure(text=f"Auswahl drucken ({picked * each} Seiten)")
+            else:
+                print_btn.configure(text="Auswahl drucken")
+            if three.get():
+                batch_hint.configure(
+                    text="Jedes angehakte Konsil dreimal hintereinander, alles in einem Auftrag. Im Druckdialog die Anzahl auf 1 lassen."
+                )
+            else:
+                batch_hint.configure(
+                    text="Jedes angehakte Konsil einmal, alles in einem Auftrag. Im Druckdialog die Anzahl auf 1 lassen."
+                )
+
+        three.trace_add("write", lambda *_: refresh_caption())
+
+        def do_open_index(index: int):
+            if index < 0 or index >= len(entries):
+                return
+            path = entries[index]["path"]
             win.destroy()
             self._open_konsil(path)
 
-        def do_delete():
-            choice = selected()
-            if choice is None:
+        def do_open(_event=None):
+            if not entries:
                 return
-            index, path = choice
-            label = box.get(index).rsplit("    ", 1)[0]
-            if not messagebox.askyesno("Löschen", f"„{label}“ löschen?", parent=win):
+            do_open_index(selected["index"])
+
+        def do_delete():
+            if not entries:
+                return
+            index = selected["index"]
+            entry = entries[index]
+            if not messagebox.askyesno("Löschen", f"„{entry['title']}“ löschen?", parent=win):
                 return
             try:
-                path.unlink()
+                entry["path"].unlink()
             except OSError as exc:
                 messagebox.showerror("Löschen", str(exc), parent=win)
                 return
-            if self._konsil_file is not None and path.resolve() == self._konsil_file.resolve():
+            if self._konsil_file is not None and entry["path"].resolve() == self._konsil_file.resolve():
                 self._konsil_file = None
                 self._snapshot = ""
                 self._refresh_title()
-            box.delete(index)
-            del labels[index]
-            if not labels:
-                box.configure(state="normal")
-                box.insert("end", "Noch nichts gespeichert.")
-                box.configure(state="disabled")
+            del files[index]
+            build_rows(index)
 
-        box.bind("<Double-Button-1>", do_open)
-        box.bind("<Return>", do_open)
+        def do_print():
+            if self._printing:
+                return
+            picked = [entry for entry in entries if entry["var"].get()]
+            if not picked:
+                messagebox.showwarning("Druck", "Bitte mindestens ein Konsil ankreuzen.", parent=win)
+                return
+            payloads: list[dict] = []
+            for entry in picked:
+                data = entry["data"]
+                if not isinstance(data, dict):
+                    try:
+                        data = json.loads(entry["path"].read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError) as exc:
+                        messagebox.showerror("Druck", str(exc), parent=win)
+                        return
+                if not isinstance(data, dict) or "values" not in data:
+                    messagebox.showerror("Druck", f"„{entry['title']}“ ist kein Konsil.", parent=win)
+                    return
+                stamp = str(data.get("stamp_path") or "").strip()
+                if stamp and not Path(stamp).is_file():
+                    messagebox.showerror(
+                        "Druck",
+                        f"Bei „{entry['title']}“ fehlt das Etikett:\n{stamp}",
+                        parent=win,
+                    )
+                    return
+                payloads.append(data)
+            each = 3 if three.get() else 1
+            printer_name = self.printer.get().strip()
+            win.grab_release()
+            try:
+                choice = gdi_print.ask_print(win.winfo_id(), printer_name, 1)
+            except OSError as exc:
+                if win.winfo_exists():
+                    win.grab_set()
+                    messagebox.showerror("Druck", str(exc), parent=win)
+                return
+            if choice is None:
+                if win.winfo_exists():
+                    win.grab_set()
+                return
+            known = list(self.printer_combo["values"])
+            if choice.printer_name not in known:
+                known.append(choice.printer_name)
+                self.printer_combo["values"] = known
+            self.printer.set(choice.printer_name)
+            self._update_paper_info()
+            shift_x = _parse_mm(self.shift_x.get(), 0.0)
+            shift_y = _parse_mm(self.shift_y.get(), 0.0)
+            self._printing = True
+            self.print_button.configure(state="disabled")
+            if win.winfo_exists():
+                try:
+                    print_btn.configure(state="disabled")
+                except tk.TclError:
+                    pass
+            threading.Thread(
+                target=self._print_many_worker,
+                args=(choice, payloads, each, shift_x, shift_y, win, print_btn),
+                daemon=True,
+            ).start()
+            if win.winfo_exists():
+                win.grab_set()
+
         buttons = ttk.Frame(win)
         buttons.pack(fill="x", padx=12, pady=12)
         ttk.Button(buttons, text="Öffnen", command=do_open).pack(side="left")
         ttk.Button(buttons, text="Löschen", command=do_delete).pack(side="left", padx=6)
+        print_btn = tk.Button(
+            buttons,
+            text="Auswahl drucken",
+            command=do_print,
+            bg="#1a6f8a",
+            fg="white",
+            activebackground="#14586e",
+            activeforeground="white",
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=3,
+            relief="flat",
+        )
+        print_btn.pack(side="right", padx=(6, 0))
         ttk.Button(buttons, text="Schließen", command=win.destroy).pack(side="right")
+        canvas.bind("<Return>", do_open)
+        canvas.bind("<Up>", lambda _e: select(selected["index"] - 1))
+        canvas.bind("<Down>", lambda _e: select(selected["index"] + 1))
+        build_rows(0)
+        canvas.focus_set()
         win.wait_window()
 
     def _open_konsil(self, path: Path):
@@ -1446,6 +1834,53 @@ class FormApp(tk.Tk):
         self._save_config()
         self.destroy()
 
+    def _render_print_page(
+        self,
+        payload: dict,
+        metrics: dict,
+        registration: bool,
+        shift_x: float,
+        shift_y: float,
+    ) -> Image.Image:
+        dpi_x = metrics["dpi_x"]
+        dpi_y = metrics["dpi_y"]
+        box = payload.get("stamp_box") or self._stamp_box()
+        stamp = None
+        if payload.get("stamp_path") and not registration:
+            stamp = overlay.load_stamp(
+                payload["stamp_path"],
+                box["w"],
+                box["h"],
+                dpi_x,
+                dpi_y,
+                payload.get("stamp_mode") or "native",
+            )
+        image = overlay.render_overlay(
+            {} if registration else (payload.get("values") or {}),
+            {} if registration else (payload.get("checks") or {}),
+            dpi_x,
+            dpi_y,
+            stamp=stamp,
+            stamp_box=box,
+            stamp_align="bottomright",
+            registration=registration,
+            transparent=False,
+            ink_scale=max(1.0, min(2.0, float(payload.get("ink", 100)) / 100.0)),
+        )
+        if registration:
+            draw = ImageDraw.Draw(image)
+            draw.text(
+                (mm_to_px(18, dpi_x), mm_to_px(8, dpi_y)),
+                f"Passkreuze    Korrektur X {shift_x:+.1f} mm    Y {shift_y:+.1f} mm",
+                font=_font(max(12, mm_to_px(3.2, dpi_y))),
+                fill=(180, 0, 0),
+                anchor="ls",
+            )
+        page = Image.new("RGB", (metrics["phys_w"], metrics["phys_h"]), "white")
+        image = image.crop((0, 0, min(image.width, page.width), min(image.height, page.height)))
+        page.paste(image, (0, 0))
+        return page
+
     def print_form(self):
         self._print(registration=False)
 
@@ -1488,47 +1923,15 @@ class FormApp(tk.Tk):
         try:
             hdc = gdi_print.create_printer_dc(choice.printer_name, choice.devmode)
             metrics = gdi_print.metrics_from_hdc(hdc)
-            dpi_x = metrics["dpi_x"]
-            dpi_y = metrics["dpi_y"]
-            box = payload["stamp_box"]
-            align = "bottomright"
-            stamp = None
-            if payload["stamp_path"] and not registration:
-                stamp = overlay.load_stamp(
-                    payload["stamp_path"], box["w"], box["h"], dpi_x, dpi_y, payload["stamp_mode"]
-                )
-            image = overlay.render_overlay(
-                {} if registration else payload["values"],
-                {} if registration else payload["checks"],
-                dpi_x,
-                dpi_y,
-                stamp=stamp,
-                stamp_box=box,
-                stamp_align=align,
-                registration=registration,
-                transparent=False,
-                ink_scale=max(1.0, min(2.0, float(payload.get("ink", 100)) / 100.0)),
-            )
-            if registration:
-                shift_x = _parse_mm(payload["shift_x"], 0.0)
-                shift_y = _parse_mm(payload["shift_y"], 0.0)
-                draw = ImageDraw.Draw(image)
-                draw.text(
-                    (mm_to_px(18, dpi_x), mm_to_px(8, dpi_y)),
-                    f"Passkreuze    Korrektur X {shift_x:+.1f} mm    Y {shift_y:+.1f} mm",
-                    font=_font(max(12, mm_to_px(3.2, dpi_y))),
-                    fill=(180, 0, 0),
-                    anchor="ls",
-                )
-            page = Image.new("RGB", (metrics["phys_w"], metrics["phys_h"]), "white")
-            image = image.crop((0, 0, min(image.width, page.width), min(image.height, page.height)))
-            page.paste(image, (0, 0))
+            shift_x = _parse_mm(payload["shift_x"], 0.0)
+            shift_y = _parse_mm(payload["shift_y"], 0.0)
+            page = self._render_print_page(payload, metrics, registration, shift_x, shift_y)
             gdi_print.draw_on_dc(
                 hdc,
                 page,
                 choice.page_loops,
-                _parse_mm(payload["shift_x"], 0.0),
-                _parse_mm(payload["shift_y"], 0.0),
+                shift_x,
+                shift_y,
                 "Konsil Passkreuze" if registration else "Konsil Vordruck",
             )
         except Exception as exc:
@@ -1547,6 +1950,76 @@ class FormApp(tk.Tk):
         finally:
             gdi_print.close_dc(hdc)
             self.after(0, self._print_finished)
+
+    def _print_many_worker(
+        self,
+        choice: gdi_print.PrintChoice,
+        payloads: list[dict],
+        each: int,
+        shift_x: float,
+        shift_y: float,
+        win: tk.Toplevel,
+        print_btn: tk.Button,
+    ):
+        hdc = None
+        session = None
+        drawn = 0
+        sheets = len(payloads) * max(1, each) * max(1, choice.page_loops)
+
+        def tell(kind: str, text: str):
+            def show(kind=kind, text=text):
+                parent = win if win.winfo_exists() else self
+                if kind == "error":
+                    messagebox.showerror("Druck", text, parent=parent)
+                else:
+                    messagebox.showinfo("Druck", text, parent=parent)
+
+            self.after(0, show)
+
+        try:
+            hdc = gdi_print.create_printer_dc(choice.printer_name, choice.devmode)
+            session = gdi_print.PrintSession(hdc, "Konsile")
+            for _loop in range(max(1, choice.page_loops)):
+                for payload in payloads:
+                    name = str(payload.get("name") or "Konsil")
+                    try:
+                        page = self._render_print_page(payload, session.metrics, False, shift_x, shift_y)
+                    except Exception as exc:
+                        raise OSError(f"„{name}“ konnte nicht gedruckt werden: {exc}") from exc
+                    for _copy in range(max(1, each)):
+                        session.draw(page, shift_x, shift_y)
+                        drawn += 1
+        except Exception as exc:
+            text = str(exc)
+            if drawn:
+                text += "\nSeiten davor liegen schon im Auftrag."
+            tell("error", text)
+        else:
+            note = ""
+            if choice.reported_copies > 1 and choice.page_loops == 1:
+                note = (
+                    f" Im Druckdialog stehen {choice.reported_copies} Exemplare, "
+                    "der Drucker wiederholt den ganzen Auftrag also."
+                )
+            tell("info", f"{sheets} Seiten in einem Auftrag an {choice.printer_name} gesendet.{note}")
+        finally:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            gdi_print.close_dc(hdc)
+
+            def done():
+                self._print_finished()
+                if win.winfo_exists():
+                    try:
+                        win.grab_set()
+                        print_btn.configure(state="normal")
+                    except tk.TclError:
+                        pass
+
+            self.after(0, done)
 
     def _print_finished(self):
         self._printing = False

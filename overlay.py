@@ -8,7 +8,7 @@ from pathlib import Path
 import pypdfium2 as pdfium
 from PIL import Image, ImageDraw, ImageFont
 
-from form_layout import CHECKS, PAGE_H_MM, PAGE_W_MM, TEXT_FIELDS
+from form_layout import CHECKS, PAGE_H_MM, PAGE_W_MM, SIGNATURE, TEXT_FIELDS
 
 FONT_PATH = Path(r"C:\Windows\Fonts\arial.ttf")
 FONT_BOLD_PATH = Path(r"C:\Windows\Fonts\arialbd.ttf")
@@ -224,6 +224,7 @@ def render_overlay(
 
     if stamp is not None and stamp_box:
         _paste_stamp(image, stamp, stamp_box, dpi_x, dpi_y, stamp_align)
+    _paste_signature(image, dpi_x, dpi_y)
 
     for field_id, spec in TEXT_FIELDS.items():
         raw = (values.get(field_id) or "").strip()
@@ -372,6 +373,70 @@ def _draw_centered(
     for index, line in enumerate(placed):
         y = top + index * (line_h + gap) + line_h / 2.0
         draw.text((cx, y), line, font=font, fill=ink, anchor="mm")
+
+
+_signature: Image.Image | None = None
+_signature_loaded = False
+
+
+def _load_signature() -> Image.Image | None:
+    """Blue ink only. The white paper around the stroke stays transparent."""
+    global _signature, _signature_loaded
+    if _signature_loaded:
+        return _signature
+    _signature_loaded = True
+    path = _bundle_dir() / "Unterschrift.png"
+    if not path.is_file():
+        _signature = None
+        return None
+    image = Image.open(path).convert("RGBA")
+    pixels = []
+    for red, green, blue, _alpha in image.getdata():
+        if red >= 242 and green >= 242 and blue >= 242:
+            pixels.append((red, green, blue, 0))
+        else:
+            pixels.append((red, green, blue, 255))
+    image.putdata(pixels)
+    alpha = image.getchannel("A")
+    bbox = alpha.point(lambda value: 255 if value > 12 else 0).getbbox()
+    if bbox:
+        image = image.crop(bbox)
+    _signature = image
+    return _signature
+
+
+def _paste_signature(image: Image.Image, dpi_x: float, dpi_y: float):
+    signature = _load_signature()
+    if signature is None or signature.width < 1 or signature.height < 1:
+        return
+    max_w = max(1, mm_to_px(SIGNATURE["w"], dpi_x))
+    max_h = max(1, mm_to_px(SIGNATURE["h"], dpi_y))
+    factor = min(max_w / signature.width, max_h / signature.height)
+    size = (
+        max(1, int(round(signature.width * factor))),
+        max(1, int(round(signature.height * factor))),
+    )
+    scaled = signature.resize(size, Image.Resampling.LANCZOS)
+    left = mm_to_px(SIGNATURE["x"], dpi_x) + (max_w - scaled.width) // 2
+    top = mm_to_px(SIGNATURE["y"], dpi_y) + (max_h - scaled.height)
+    _paste_rgba(image, scaled, left, top)
+
+
+def _paste_rgba(image: Image.Image, sprite: Image.Image, left: int, top: int):
+    sprite = sprite.convert("RGBA")
+    if left < 0 or top < 0:
+        sprite = sprite.crop((-min(0, left), -min(0, top), sprite.width, sprite.height))
+        left = max(0, left)
+        top = max(0, top)
+    if left >= image.width or top >= image.height:
+        return
+    sprite = sprite.crop((0, 0, min(sprite.width, image.width - left), min(sprite.height, image.height - top)))
+    if sprite.width <= 0 or sprite.height <= 0:
+        return
+    if image.mode == "RGBA":
+        image.alpha_composite(sprite, (left, top))
+    else:
+        image.paste(sprite, (left, top), sprite)
 
 
 def _paste_stamp(

@@ -57,7 +57,6 @@ TEXT_FIELDS: dict[str, dict] = {
     "risiko_etc": {"lines": [_line(97.6, 178.86, 109.0, 9)]},
     "diagnose": {"lines": [_line(71.6, 197.90, 135.0)]},
     "oa_name": {"lines": [_line(32.0, 204.26, 74.0)]},
-    "aa_name": {"lines": [_line(159.0, 204.26, 48.0)]},
     "kasse": {"lines": [_line(48.2, 229.66, 155.0)]},
     "hilfsmittel_text": {"lines": [_line(147.2, 255.12, 60.0, 9)]},
     "privat_text": {"lines": [_line(144.4, 261.58, 62.0, 9)]},
@@ -103,3 +102,7 @@ CHECKS: dict[str, tuple[float, float]] = {
 # top-left. Place that block on the right, just above the red
 # "Patientenetikett" line, clear of the red words.
 STAMP_DEFAULT = {"x": 149.0, "y": 85.5, "w": 56.0, "h": 27.0}
+
+# Assistenzarzt signature (Unterschrift.png). The box is the line under
+# "Unterschrift (Ass. Arzt)". Ink is fitted inside and sits on that underline.
+SIGNATURE = {"x": 159.0, "y": 186.6, "w": 48.0, "h": 18.9}

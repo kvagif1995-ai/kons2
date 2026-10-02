@@ -394,6 +394,43 @@ def draw_on_dc(
         gdi.EndDoc(hdc)
 
 
+class PrintSession:
+    """One spooler job that can hold several different pages."""
+
+    def __init__(self, hdc, doc_name: str):
+        self.hdc = hdc
+        self.gdi = _gdi32()
+        self.gdi.StartDocW.argtypes = [wintypes.HDC, ctypes.POINTER(_DOCINFOW)]
+        self.gdi.SetMapMode(hdc, _MM_TEXT)
+        self.metrics = metrics_from_hdc(hdc)
+        self._open = False
+        info = _DOCINFOW(ctypes.sizeof(_DOCINFOW), doc_name, None, None, 0)
+        if self.gdi.StartDocW(hdc, ctypes.byref(info)) <= 0:
+            raise OSError("Der Druckauftrag wurde vom Drucker nicht angenommen.")
+        self._open = True
+
+    def draw(self, page: Image.Image, shift_x_mm: float, shift_y_mm: float):
+        if not self._open:
+            raise OSError("Der Druckauftrag ist schon abgeschlossen.")
+        image = page.convert("RGB")
+        dib = ImageWin.Dib(image)
+        dx = -self.metrics["off_x"] + int(round(shift_x_mm / 25.4 * self.metrics["dpi_x"]))
+        dy = -self.metrics["off_y"] + int(round(shift_y_mm / 25.4 * self.metrics["dpi_y"]))
+        dest = (dx, dy, dx + image.width, dy + image.height)
+        if self.gdi.StartPage(self.hdc) <= 0:
+            raise OSError("Der Druckauftrag wurde vom Drucker nicht angenommen.")
+        try:
+            dib.draw(int(self.hdc), dest)
+        finally:
+            if self.gdi.EndPage(self.hdc) < 0:
+                raise OSError("Der Druckauftrag wurde vom Drucker nicht abgeschlossen.")
+
+    def close(self):
+        if self._open:
+            self._open = False
+            self.gdi.EndDoc(self.hdc)
+
+
 def close_dc(hdc):
     if hdc:
         _gdi32().DeleteDC(hdc)
