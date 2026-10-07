@@ -20,7 +20,7 @@ def mm_to_px(mm: float, dpi: float) -> int:
 
 
 def _font(size_px: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    size_px = max(6, int(size_px))
+    size_px = max(4, int(size_px))
     key = (size_px, bold)
     hit = _fonts.get(key)
     if hit is not None:
@@ -89,6 +89,159 @@ def _wrap(draw: ImageDraw.ImageDraw, text: str, widths: list[int], pt: float, dp
         extra = " ".join(current)
         lines[-1] = (lines[-1] + " " + extra).strip()
     return lines
+
+
+def normalize_flow(text: str) -> str:
+    """One paragraph. Line breaks become spaces so the block can wrap."""
+    return " ".join(text.replace("\r\n", "\n").replace("\r", "\n").split())
+
+
+def flow_lines(text: str, widths: list[float], measure) -> list[str] | None:
+    """Wrap words onto the line widths. None when the text does not fit."""
+    words = normalize_flow(text).split()
+    if not words:
+        return []
+    if not widths or any(width <= 0 for width in widths):
+        return None
+    lines: list[list[str]] = []
+    index = 0
+    current: list[str] = []
+    for word in words:
+        if index >= len(widths):
+            return None
+        if not current and measure(word) > widths[index]:
+            return None
+        if current and measure(" ".join(current + [word])) > widths[index]:
+            lines.append(current)
+            current = []
+            index += 1
+            if index >= len(widths) or measure(word) > widths[index]:
+                return None
+        current.append(word)
+    if current:
+        lines.append(current)
+    return [" ".join(parts) for parts in lines]
+
+
+def _flow_force(text: str, widths: list[float], measure) -> list[str]:
+    """Break long words so the text still lands on the given lines."""
+    raw = normalize_flow(text)
+    if not raw or not widths:
+        return []
+    lines: list[str] = []
+    current = ""
+    index = 0
+    cursor = 0
+    while cursor < len(raw) and index < len(widths):
+        char = raw[cursor]
+        if char == " " and not current:
+            cursor += 1
+            continue
+        trial = current + char
+        if current and measure(trial) > widths[index]:
+            lines.append(current.strip())
+            current = ""
+            index += 1
+            continue
+        if not current and char != " " and measure(char) > widths[index]:
+            lines.append(char)
+            index += 1
+            cursor += 1
+            continue
+        current = trial
+        cursor += 1
+    if current.strip() and index < len(widths):
+        lines.append(current.strip())
+    elif current.strip() and lines:
+        lines[-1] = (lines[-1] + " " + current.strip()).strip()
+    return lines
+
+
+def fit_flow(
+    text: str,
+    widths: list[float],
+    max_size: int,
+    measure_for,
+    linespace_for,
+    gap: float,
+    floor: int = 4,
+) -> tuple[int, list[str]]:
+    """Largest size at or below max_size that wraps inside the lines.
+
+    A single line may use the full chosen size. Further lines also have to
+    fit in the gap between one underline and the next.
+    """
+    cleaned = normalize_flow(text)
+    size = max(floor, int(max_size))
+    if not cleaned:
+        return size, []
+
+    def fits(at: int) -> list[str] | None:
+        lines = flow_lines(cleaned, widths, measure_for(at))
+        if lines is None:
+            return None
+        if len(lines) > 1 and linespace_for(at) > gap + 0.5:
+            return None
+        return lines
+
+    while size > floor:
+        placed = fits(size)
+        if placed is not None:
+            return size, placed
+        size -= 1
+    placed = fits(floor)
+    if placed is not None:
+        return floor, placed
+    return floor, _flow_force(cleaned, widths, measure_for(floor))
+
+
+def _shrink_font(draw: ImageDraw.ImageDraw, text: str, font, max_w: int):
+    px = getattr(font, "size", 6)
+    while px > 4 and text and _text_width(draw, text, font) > max_w:
+        px -= 1
+        font = _font(px)
+    return font
+
+
+def _draw_block(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    lines_spec: list[dict],
+    pt: float,
+    dpi_x: float,
+    dpi_y: float,
+    ink,
+):
+    """Wrap one paragraph onto the underlines, shrinking from the chosen size."""
+    widths = [max(1, mm_to_px(line["w"], dpi_x)) for line in lines_spec]
+    max_px = _pt_to_px(pt, dpi_y)
+    if len(lines_spec) > 1:
+        steps = [abs(lines_spec[i + 1]["y"] - lines_spec[i]["y"]) for i in range(len(lines_spec) - 1)]
+        gap = mm_to_px(sum(steps) / len(steps), dpi_y)
+    else:
+        gap = 10**6
+
+    def measure_for(size: int):
+        font = _font(size)
+        return lambda sample, font=font: _text_width(draw, sample, font)
+
+    def linespace_for(size: int) -> int:
+        ascent, descent = _line_box(_font(size))
+        return ascent + descent
+
+    px, placed = fit_flow(text, widths, max_px, measure_for, linespace_for, gap, floor=4)
+    font = _font(px)
+    for line, content in zip(lines_spec, placed):
+        if not content:
+            continue
+        use = _shrink_font(draw, content, font, max(1, mm_to_px(line["w"], dpi_x)))
+        draw.text(
+            (mm_to_px(line["x"], dpi_x), mm_to_px(line["y"], dpi_y)),
+            content,
+            font=use,
+            fill=ink,
+            anchor="ls",
+        )
 
 
 def draw_checkmark(
@@ -234,6 +387,9 @@ def render_overlay(
             continue
         if "box" in spec:
             _draw_centered(draw, raw, spec, dpi_x, dpi_y, ink, ink_scale)
+            continue
+        if spec.get("block"):
+            _draw_block(draw, raw, spec["lines"], (spec.get("size") or spec["lines"][0]["size"]) * ink_scale, dpi_x, dpi_y, ink)
             continue
         lines_spec = spec["lines"]
         pt = (spec.get("size") or lines_spec[0]["size"]) * ink_scale

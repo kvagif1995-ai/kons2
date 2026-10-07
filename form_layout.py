@@ -39,19 +39,17 @@ TEXT_FIELDS: dict[str, dict] = {
         ]
     },
     "tel": {"lines": [_line(169.6, 128.00, 37.5)]},
+    # One block. Line 1 starts after "Fragestellung:", line 3 after
+    # "wichtige Vorbefunde:", and the other two lines use the full underline.
     "fragestellung": {
         "lines": [
             _line(55.0, 140.76, 152.0, 9.5),
             _line(31.2, 147.11, 176.0, 9.5),
-        ],
-        "size": 9.5,
-    },
-    "vorbefunde": {
-        "lines": [
             _line(66.0, 153.46, 141.0, 9.5),
             _line(31.2, 159.72, 176.0, 9.5),
         ],
         "size": 9.5,
+        "block": True,
     },
     "infekt_detail": {"lines": [_line(54.0, 170.36, 12.2, 8)]},
     "risiko_etc": {"lines": [_line(97.6, 178.86, 109.0, 9)]},

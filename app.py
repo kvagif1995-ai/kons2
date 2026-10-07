@@ -7,6 +7,7 @@ the marks and the chosen label PDF. Put the blank paper forms in the tray.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import threading
 import tkinter as tk
@@ -28,6 +29,21 @@ def _safe_stem(name: str) -> str:
     return cleaned[:80] or "Konsil"
 
 
+def _etikett_file(json_path: Path) -> Path:
+    """Label PDF stored beside the Konsil, so the save does not depend on Downloads."""
+    return json_path.with_name(json_path.stem + ".etikett.pdf")
+
+
+def _stored_etikett(data: dict, folder: Path) -> str:
+    """Prefer the copy saved with the Konsil. Fall back to the original path."""
+    name = str(data.get("stamp_file") or "").strip()
+    if name and Path(name).name == name:
+        candidate = folder / name
+        if candidate.is_file():
+            return str(candidate)
+    return str(data.get("stamp_path") or "").strip()
+
+
 def _install_dir() -> Path:
     """Folder the user runs. Settings stay beside the exe."""
     if getattr(sys, "frozen", False):
@@ -43,7 +59,7 @@ PREVIEW_DPI = 120
 # Filled on almost every form. Highlighted until the user turns that off.
 IMPORTANT_DEFAULT = {
     "fachrichtung", "geb_am", "station", "beh_arzt", "tel",
-    "fragestellung", "vorbefunde", "diagnose",
+    "fragestellung", "diagnose",
 }
 # Same from one form to the next. Restored on the next start.
 REMEMBER_DEFAULT = {
@@ -67,7 +83,7 @@ FIELD_ORDER = (
     "ihr_zeichen", "unser_zeichen", "sachbearbeiter", "brief_datum",
     "stamp_path",
     "geb_am", "station", "beh_arzt", "tel",
-    "fragestellung", "vorbefunde",
+    "fragestellung",
     "infekt", "infekt_detail",
     "risiken", "risiko_etc",
     "transport", "begleit_anz",
@@ -86,8 +102,7 @@ CAPTIONS = {
     "station": "Station",
     "beh_arzt": "Beh. Arzt im Bezirkskrankenhaus",
     "tel": "Tel.-Nr. (bei Rückfrage)",
-    "fragestellung": "Fragestellung",
-    "vorbefunde": "Wichtige Vorbefunde",
+    "fragestellung": "Fragestellung und wichtige Vorbefunde",
     "infekt": "Infektiosität",
     "infekt_detail": "Bei ja, kurzer Zusatz (z. B. HIV)",
     "risiken": "Kreuze, Risiken",
@@ -347,6 +362,11 @@ class FormApp(tk.Tk):
         self._hover_id = None
         self._baseline_cache: dict[tuple, int] = {}
         self._wrap_draw = None
+        self._display_image: Image.Image | None = None
+        self._flow_chips: dict[str, list[tk.Label]] = {}
+        self._flow_chip_items: dict[str, list[int]] = {}
+        self._flow_photos: dict[str, list[ImageTk.PhotoImage | None]] = {}
+        self._flow_busy = False
 
         self.bools: dict[str, tk.BooleanVar] = {}
         self.important: dict[str, tk.BooleanVar] = {}
@@ -517,7 +537,11 @@ class FormApp(tk.Tk):
             if key not in TEXT_FIELDS:
                 continue
             spec = TEXT_FIELDS[key]
-            if "lines" in spec and len(spec["lines"]) > 1:
+            if spec.get("block"):
+                widget = self._make_flow(key)
+                self._field_inputs[key] = widget
+                self._remember_field(widget, paint=False)
+            elif "lines" in spec and len(spec["lines"]) > 1:
                 entries = [self._make_entry() for _ in spec["lines"]]
                 self._lines[key] = entries
                 self._field_inputs[key] = entries[0]
@@ -581,12 +605,45 @@ class FormApp(tk.Tk):
         self._embed(widget)
         return widget
 
+    def _make_flow(self, key: str) -> tk.Text:
+        """One wrapping box for a block that sits on several underlines."""
+        widget = tk.Text(
+            self.preview,
+            font=("Arial", 10),
+            wrap="none",
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            bg="#fffef8",
+            fg="#142028",
+            highlightbackground="#c5d0d6",
+            highlightcolor="#1a6f8a",
+            insertbackground="#142028",
+            selectbackground="#1a6f8a",
+            selectforeground="white",
+            undo=True,
+            padx=1,
+            pady=0,
+            spacing1=0,
+            spacing3=0,
+        )
+        widget._flow_key = key
+        widget.tag_configure("flow", lmargin1=0, lmargin2=0)
+        widget.tag_add("flow", "1.0", "end")
+        self._embed(widget)
+        widget.bind("<KeyRelease>", lambda _e, box=widget: self._on_flow_key(box), add="+")
+        widget.bind("<<Paste>>", lambda _e, box=widget: box.after(1, lambda: self._on_flow_key(box)), add="+")
+        self._flow_chips[key] = []
+        self._flow_chip_items[key] = []
+        self._flow_photos[key] = []
+        return widget
+
     def _embed(self, widget: tk.Widget):
         item = self.preview.create_window(-2000, -2000, window=widget, anchor="nw", tags="field")
         self._windows[str(widget)] = item
         widget.bind("<FocusIn>", lambda _e, mark=item, box=widget: self._focus_field(mark, box), add="+")
 
-    def _remember_field(self, widget: tk.Widget, newline: bool = False):
+    def _remember_field(self, widget: tk.Widget, newline: bool = False, paint: bool = True):
         self._tab_chain.append(widget)
         widget.bind("<MouseWheel>", self._wheel, add="+")
         widget.bind("<Tab>", self._tab_next, add="+")
@@ -594,11 +651,17 @@ class FormApp(tk.Tk):
         widget.bind("<ISO_Left_Tab>", self._tab_prev, add="+")
         if not newline:
             widget.bind("<Return>", self._tab_next, add="+")
-            widget.bind("<KeyRelease>", lambda _e, box=widget: self._paint_overflow(box), add="+")
+            if paint:
+                widget.bind("<KeyRelease>", lambda _e, box=widget: self._paint_overflow(box), add="+")
 
     def _focus_field(self, item: int, _widget: tk.Widget):
         self.preview.tag_raise(item)
+        self._raise_flow_labels()
         self._reveal_item(item)
+
+    def _raise_flow_labels(self):
+        if self._flow_chip_items:
+            self.preview.tag_raise("flow-label")
 
     def _reveal_item(self, item: int):
         _x, y = self.preview.coords(item)
@@ -672,6 +735,8 @@ class FormApp(tk.Tk):
         nxt.focus_set()
 
     def _paint_overflow(self, widget: tk.Entry):
+        if not isinstance(widget, tk.Entry):
+            return
         limit = getattr(widget, "_max_text_px", 0)
         if limit <= 0:
             return
@@ -724,7 +789,9 @@ class FormApp(tk.Tk):
             return
         editing = not self.show_marks.get()
         for key, spec in TEXT_FIELDS.items():
-            if "box" in spec:
+            if spec.get("block"):
+                self._layout_block(key, spec, editing)
+            elif "box" in spec:
                 self._layout_box(key, spec, editing)
             elif key in self._lines:
                 for widget, line in zip(self._lines[key], spec["lines"]):
@@ -737,6 +804,7 @@ class FormApp(tk.Tk):
         self._draw_importance_marks()
         self.preview.tag_raise("hover")
         self.preview.tag_raise("field")
+        self._raise_flow_labels()
 
     def _layout_line(self, widget: tk.Entry, line: dict, editing: bool, bold: bool):
         size = float(line["size"])
@@ -764,6 +832,249 @@ class FormApp(tk.Tk):
         widget._max_text_px = width
         self._move_window(widget, left, top, width, height, editing)
         self._paint_overflow(widget)
+
+    def _on_flow_key(self, widget: tk.Text):
+        if self._flow_busy or getattr(widget, "_flow_sync", False):
+            return
+        key = getattr(widget, "_flow_key", None)
+        spec = TEXT_FIELDS.get(key or "")
+        if not isinstance(spec, dict):
+            return
+        self._flow_busy = True
+        try:
+            if self._preview_scale > 0:
+                self._layout_block(str(key), spec, not self.show_marks.get())
+        finally:
+            self._flow_busy = False
+
+    def _max_line_pt(self, size: float) -> int:
+        """Same ceiling as the other fields: the chosen Schrift, shrunk to the row."""
+        max_h = self._px(5.4 * self._ink_factor())
+        pt = self._screen_pt(size)
+        while pt > 6:
+            metrics = tkfont.Font(family="Arial", size=pt)
+            if metrics.metrics("ascent") + metrics.metrics("descent") + 2 <= max_h:
+                break
+            pt -= 1
+        return pt
+
+    def _text_baseline(self, font_spec) -> int:
+        key = ("text", tuple(font_spec))
+        cached = self._baseline_cache.get(key)
+        if cached is not None:
+            return cached
+        probe = tk.Text(
+            self, font=font_spec, relief="flat", bd=0, highlightthickness=1,
+            padx=1, pady=0, wrap="none",
+        )
+        probe.insert("1.0", "Hg")
+        probe.place(x=-900, y=-900, width=180, height=70)
+        self.update_idletasks()
+        bbox = probe.bbox("1.0")
+        ascent = tkfont.Font(font=font_spec).metrics("ascent")
+        offset = (bbox[1] + ascent) if bbox else (ascent + 2)
+        probe.destroy()
+        self._baseline_cache[key] = offset
+        return offset
+
+    def _flow_display_lines(self, widget: tk.Text) -> int | None:
+        try:
+            widget.update_idletasks()
+            if not widget.get("1.0", "end-1c").strip():
+                return 1
+            counted = widget.count("1.0", "end-1c", "displaylines")
+        except tk.TclError:
+            return None
+        # Tk counts the breaks between display lines, so one wrapped line
+        # reports 0 (None) and two wrapped lines report 1.
+        if not counted:
+            return 1
+        return int(counted[0]) + 1
+
+    def _apply_flow_font(self, widget: tk.Text, pt: int, gap_px: float):
+        font_spec = ("Arial", max(1, int(pt)))
+        widget.configure(font=font_spec, spacing2=0, spacing3=0)
+        linespace = tkfont.Font(font=font_spec).metrics("linespace")
+        # Each wrapped line is its own paragraph, so the gap sits below the line.
+        widget.configure(spacing3=max(0, int(round(gap_px - linespace))))
+        widget._laid_pt = pt
+        widget.tag_add("flow", "1.0", "end")
+
+    def _layout_block(self, key: str, spec: dict, editing: bool):
+        widget = self._field_inputs.get(key)
+        if not isinstance(widget, tk.Text):
+            return
+        lines = spec["lines"]
+        left_mm = min(line["x"] for line in lines)
+        right_mm = max(line["x"] + line["w"] for line in lines)
+        max_pt = self._max_line_pt(float(spec.get("size") or lines[0]["size"]))
+        pad = (
+            int(widget.cget("highlightthickness") or 0)
+            + int(widget.cget("padx") or 0)
+            + int(widget.cget("borderwidth") or 0)
+        )
+        content_w = max(8, int(round(self._px(right_mm - left_mm))))
+        indents = []
+        wrap_widths = []
+        for line in lines:
+            indent = max(0, int(round(self._px(line["x"] - left_mm))))
+            indent = min(indent, content_w - 8)
+            indents.append(indent)
+            wrap_widths.append(max(4, content_w - indent))
+        outer_w = content_w + 2 * pad
+        if len(lines) > 1:
+            steps = [lines[i + 1]["y"] - lines[i]["y"] for i in range(len(lines) - 1)]
+            gap_px = self._px(sum(steps) / len(steps))
+        else:
+            gap_px = 0.0
+        span_px = gap_px * max(0, len(lines) - 1)
+        self._apply_flow_font(widget, max_pt, gap_px)
+        font_spec = ("Arial", max_pt)
+        offset = self._text_baseline(font_spec)
+        descent = tkfont.Font(font=font_spec).metrics("descent")
+        left = self._page_ox + self._px(left_mm) - pad
+        top = self._page_oy + self._px(lines[0]["y"]) - offset
+        height = max(12, offset + span_px + descent + 2)
+        self._move_window(widget, left, top, outer_w, height, editing)
+
+        def measure_for(pt: int):
+            font = tkfont.Font(family="Arial", size=max(1, pt))
+            return font.measure
+
+        def linespace_for(pt: int) -> int:
+            return tkfont.Font(family="Arial", size=max(1, pt)).metrics("linespace")
+
+        pt, placed = overlay.fit_flow(
+            widget.get("1.0", "end-1c"),
+            wrap_widths,
+            max_pt,
+            measure_for,
+            linespace_for,
+            gap_px,
+            floor=4,
+        )
+        self._apply_flow_font(widget, pt, gap_px)
+        self._show_flow_lines(widget, placed, indents)
+
+        font_spec = ("Arial", max(1, pt))
+        offset = self._text_baseline(font_spec)
+        descent = tkfont.Font(font=font_spec).metrics("descent")
+        ascent = tkfont.Font(font=font_spec).metrics("ascent")
+        top = self._page_oy + self._px(lines[0]["y"]) - offset
+        height = max(12, offset + span_px + descent + 2)
+        self._move_window(widget, left, top, outer_w, height, editing)
+        self._place_flow_chips(key, widget, lines, left_mm, top, pad, descent, ascent, editing)
+
+    def _show_flow_lines(self, widget: tk.Text, placed: list[str], indents: list[int]):
+        """Show the wrapped lines, each starting at its own underline."""
+        display = "\n".join(placed)
+        current = widget.get("1.0", "end-1c")
+        widget._flow_sync = True
+        try:
+            if current != display:
+                cursor = len(widget.get("1.0", "insert").replace("\r", "").replace("\n", " "))
+                widget.delete("1.0", "end")
+                if display:
+                    widget.insert("1.0", display)
+                self._move_flow_cursor(widget, display, cursor)
+            count = int(widget.index("end-1c").split(".")[0]) if widget.get("1.0", "end-1c") else 0
+            for index, margin in enumerate(indents):
+                name = f"margin{index}"
+                widget.tag_configure(name, lmargin1=margin, lmargin2=margin)
+                widget.tag_raise(name)
+                if index < count:
+                    widget.tag_add(name, f"{index + 1}.0", f"{index + 1}.end")
+        finally:
+            widget._flow_sync = False
+
+    def _move_flow_cursor(self, widget: tk.Text, display: str, index: int):
+        index = max(0, min(index, len(display.replace("\n", " "))))
+        line_no = 1
+        column = 0
+        seen = 0
+        for char in display:
+            if seen >= index:
+                break
+            seen += 1
+            if char == "\n":
+                line_no += 1
+                column = 0
+            else:
+                column += 1
+        widget.mark_set("insert", f"{line_no}.{column}")
+
+    def _add_flow_chip(self, key: str, widget: tk.Text):
+        chip = tk.Label(self.preview, bd=0, highlightthickness=0, padx=0, pady=0, bg="#ffffff")
+        chip.bind("<Button-1>", lambda _e, box=widget: box.focus_set())
+        item = self.preview.create_window(-2000, -2000, window=chip, anchor="nw", tags="flow-label")
+        self._flow_chips[key].append(chip)
+        self._flow_chip_items[key].append(item)
+        self._flow_photos[key].append(None)
+
+    def _place_flow_chips(
+        self,
+        key: str,
+        widget: tk.Text,
+        lines: list[dict],
+        left_mm: float,
+        widget_top: float,
+        pad: int,
+        descent: int,
+        ascent: int,
+        editing: bool,
+    ):
+        """Put each printed label back on top of the box so the cream does not hide it."""
+        chips = self._flow_chips.get(key)
+        items = self._flow_chip_items.get(key)
+        if chips is None or items is None:
+            return
+        for item in items:
+            self.preview.itemconfigure(item, state="hidden")
+        if not editing or self._display_image is None:
+            return
+        used = 0
+        for index, line in enumerate(lines):
+            if line["x"] - left_mm < 0.4:
+                continue
+            while used >= len(chips):
+                self._add_flow_chip(key, widget)
+            chip = chips[used]
+            item = items[used]
+            chip_x = self._page_ox + self._px(left_mm)
+            chip_w = max(1, int(round(self._px(line["x"] - left_mm))))
+            base = self._page_oy + self._px(line["y"])
+            chip_top = widget_top + pad if index == 0 else base - ascent
+            next_top = None
+            if index + 1 < len(lines):
+                next_top = self._page_oy + self._px(lines[index + 1]["y"]) - ascent
+            chip_bottom = base + descent + 1
+            if next_top is not None:
+                chip_bottom = min(chip_bottom, next_top - 1)
+            chip_h = int(round(chip_bottom - chip_top))
+            photo = self._chip_photo(chip_x, chip_top, chip_w, chip_h)
+            if photo is None or chip_h < 2:
+                used += 1
+                continue
+            self._flow_photos[key][used] = photo
+            chip.configure(image=photo)
+            self.preview.coords(item, chip_x, chip_top)
+            self.preview.itemconfigure(item, width=chip_w, height=chip_h, state="normal")
+            used += 1
+
+    def _chip_photo(self, x: float, y: float, w: int, h: int):
+        image = self._display_image
+        if image is None or w < 2 or h < 2:
+            return None
+        ix = int(round(x - self._page_ox))
+        iy = int(round(y - self._page_oy))
+        ix2 = ix + int(w)
+        iy2 = iy + int(h)
+        if ix < 0 or iy < 0 or ix2 > image.width or iy2 > image.height:
+            return None
+        crop = image.crop((ix, iy, ix2, iy2))
+        if crop.width < 1 or crop.height < 1:
+            return None
+        return ImageTk.PhotoImage(crop)
 
     def _uncollide_fields(self):
         """Keep two boxes on the same line from covering each other."""
@@ -1024,6 +1335,10 @@ class FormApp(tk.Tk):
         }
 
     def _get_value(self, key: str) -> str:
+        spec = TEXT_FIELDS.get(key) or {}
+        widget = self._field_inputs.get(key)
+        if spec.get("block") and isinstance(widget, tk.Text):
+            return " ".join(widget.get("1.0", "end-1c").split())
         lines = self._lines.get(key)
         if lines:
             parts = [entry.get().replace("\n", " ") for entry in lines]
@@ -1041,6 +1356,15 @@ class FormApp(tk.Tk):
 
     def _set_value(self, key: str, value: str):
         value = "" if value is None else str(value)
+        spec = TEXT_FIELDS.get(key) or {}
+        widget = self._field_inputs.get(key)
+        if spec.get("block") and isinstance(widget, tk.Text):
+            flat = " ".join(value.split())
+            widget.delete("1.0", "end")
+            if flat:
+                widget.insert("1.0", flat)
+            widget.tag_add("flow", "1.0", "end")
+            return
         lines = self._lines.get(key)
         if lines:
             self._fill_lines(key, lines, value)
@@ -1166,11 +1490,12 @@ class FormApp(tk.Tk):
         scale = max(0.2, fit * (self._zoom / 100.0))
         display_w = max(1, int(round(image.width * scale)))
         display_h = max(1, int(round(image.height * scale)))
-        display = image.resize((display_w, display_h), Image.Resampling.BILINEAR)
+        display = image.resize((display_w, display_h), Image.Resampling.BILINEAR).convert("RGB")
+        self._display_image = display
         self._preview_scale = scale
         self._page_ox = max(margin, (view_w - display_w) / 2)
         self._page_oy = max(margin, (view_h - display_h) / 2)
-        self._photo = ImageTk.PhotoImage(display.convert("RGB"))
+        self._photo = ImageTk.PhotoImage(display)
         if self._image_id is None:
             self._image_id = self.preview.create_image(
                 self._page_ox, self._page_oy, image=self._photo, anchor="nw", tags="page",
@@ -1209,6 +1534,7 @@ class FormApp(tk.Tk):
             self.preview.itemconfigure(self._hover_id, state="normal")
             self.preview.tag_raise(self._hover_id)
             self.preview.tag_raise("field")
+            self._raise_flow_labels()
             self.preview.configure(cursor="hand2")
         else:
             if self._hover_id is not None:
@@ -1305,8 +1631,10 @@ class FormApp(tk.Tk):
             "begleit_anz": "1",
         }
         long = {
-            "fragestellung": "Bitte um konsiliarische Einschätzung der aktuellen depressiven Symptomatik und medikamentösen Optionen.",
-            "vorbefunde": "CT Schädel 2024 ohne pathologischen Befund. Vorbestehende Angststörung.",
+            "fragestellung": (
+                "Bitte um konsiliarische Einschätzung der aktuellen depressiven Symptomatik und medikamentösen Optionen. "
+                "CT Schädel 2024 ohne pathologischen Befund. Vorbestehende Angststörung."
+            ),
         }
         for key, value in sample.items():
             self._set_value(key, value)
@@ -1398,7 +1726,11 @@ class FormApp(tk.Tk):
 
             if "stamp_path" in data and keep("stamp_path"):
                 self.stamp_path.set(str(data["stamp_path"] or ""))
-            values = data.get("values") or {}
+            values = dict(data.get("values") or {})
+            earlier = str(values.get("vorbefunde") or "").strip()
+            if earlier:
+                question = str(values.get("fragestellung") or "").strip()
+                values["fragestellung"] = (question + " " + earlier).strip() if question else earlier
             for key in TEXT_FIELDS:
                 if key in values and keep(key):
                     self._set_value(key, str(values[key]))
@@ -1465,6 +1797,41 @@ class FormApp(tk.Tk):
         self._snapshot = self._form_snapshot()
         self._refresh_title()
 
+    def _store_etikett(self, json_path: Path) -> str | None:
+        """Copy the label next to the Konsil. None means the save stops."""
+        dest = _etikett_file(json_path)
+        source_text = self.stamp_path.get().strip()
+        if not source_text:
+            if dest.is_file():
+                try:
+                    dest.unlink()
+                except OSError as exc:
+                    messagebox.showerror("Speichern", str(exc))
+                    return None
+            return ""
+        source = Path(source_text)
+        if not source.is_file():
+            messagebox.showerror(
+                "Speichern",
+                "Das Etikett wurde nicht gefunden und kann nicht mit dem Konsil gespeichert werden:\n"
+                + source_text,
+            )
+            return None
+        try:
+            same = False
+            if dest.is_file():
+                try:
+                    same = source.resolve() == dest.resolve()
+                except OSError:
+                    same = False
+            if not same:
+                shutil.copyfile(source, dest)
+        except OSError as exc:
+            messagebox.showerror("Speichern", f"Etikett konnte nicht gespeichert werden:\n{exc}")
+            return None
+        self.stamp_path.set(str(dest))
+        return dest.name
+
     def save_konsil(self, save_as: bool = False) -> bool:
         try:
             KONSIL_DIR.mkdir(exist_ok=True)
@@ -1493,8 +1860,12 @@ class FormApp(tk.Tk):
                     f"„{name}“ gibt es schon. Ersetzen?",
                 ):
                     return False
+        stored = self._store_etikett(path)
+        if stored is None:
+            return False
         payload = self._payload()
         payload["name"] = name
+        payload["stamp_file"] = stored
         payload["saved_at"] = datetime.now().isoformat(timespec="minutes")
         try:
             path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1667,11 +2038,24 @@ class FormApp(tk.Tk):
             entry = entries[index]
             if not messagebox.askyesno("Löschen", f"„{entry['title']}“ löschen?", parent=win):
                 return
+            etiketten = {_etikett_file(entry["path"])}
+            saved = entry.get("data")
+            if isinstance(saved, dict):
+                stamp_name = str(saved.get("stamp_file") or "").strip()
+                if stamp_name and Path(stamp_name).name == stamp_name:
+                    etiketten.add(entry["path"].parent / stamp_name)
             try:
                 entry["path"].unlink()
             except OSError as exc:
                 messagebox.showerror("Löschen", str(exc), parent=win)
                 return
+            for etikett in etiketten:
+                if not etikett.is_file():
+                    continue
+                try:
+                    etikett.unlink()
+                except OSError as exc:
+                    messagebox.showerror("Löschen", str(exc), parent=win)
             if self._konsil_file is not None and entry["path"].resolve() == self._konsil_file.resolve():
                 self._konsil_file = None
                 self._snapshot = ""
@@ -1698,7 +2082,9 @@ class FormApp(tk.Tk):
                 if not isinstance(data, dict) or "values" not in data:
                     messagebox.showerror("Druck", f"„{entry['title']}“ ist kein Konsil.", parent=win)
                     return
-                stamp = str(data.get("stamp_path") or "").strip()
+                data = dict(data)
+                stamp = _stored_etikett(data, entry["path"].parent)
+                data["stamp_path"] = stamp
                 if stamp and not Path(stamp).is_file():
                     messagebox.showerror(
                         "Druck",
@@ -1781,6 +2167,8 @@ class FormApp(tk.Tk):
         if not isinstance(data, dict):
             messagebox.showerror("Öffnen", "Diese Datei ist kein Konsil.")
             return
+        data = dict(data)
+        data["stamp_path"] = _stored_etikett(data, path.parent)
         self._apply_payload(data)
         self._konsil_file = path
         self._konsil_name = str(data.get("name") or path.stem)
