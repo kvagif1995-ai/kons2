@@ -203,6 +203,214 @@ def _shrink_font(draw: ImageDraw.ImageDraw, text: str, font, max_w: int):
     return font
 
 
+def bold_flags(length: int, ranges) -> list[bool]:
+    """True for each character covered by a half-open [start, end] range."""
+    flags = [False] * max(0, int(length))
+    for item in ranges or []:
+        try:
+            start, end = int(item[0]), int(item[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        start = max(0, min(len(flags), start))
+        end = max(start, min(len(flags), end))
+        for index in range(start, end):
+            flags[index] = True
+    return flags
+
+
+def bold_ranges(flags: list[bool]) -> list[list[int]]:
+    ranges: list[list[int]] = []
+    start = None
+    for index, bit in enumerate(flags):
+        if bit and start is None:
+            start = index
+        elif not bit and start is not None:
+            ranges.append([start, index])
+            start = None
+    if start is not None:
+        ranges.append([start, len(flags)])
+    return ranges
+
+
+def _slice_width(text: str, flags: list[bool], measure_plain, measure_bold) -> float:
+    if not text:
+        return 0.0
+    if not flags or not any(flags[: len(text)]):
+        return float(measure_plain(text))
+    total = 0.0
+    index = 0
+    while index < len(text):
+        bit = bool(flags[index]) if index < len(flags) else False
+        end = index + 1
+        while end < len(text) and (bool(flags[end]) if end < len(flags) else False) == bit:
+            end += 1
+        measure = measure_bold if bit else measure_plain
+        total += float(measure(text[index:end]))
+        index = end
+    return total
+
+
+def _word_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        if text[index] == " ":
+            index += 1
+            continue
+        end = index + 1
+        while end < len(text) and text[end] != " ":
+            end += 1
+        spans.append((index, end))
+        index = end
+    return spans
+
+
+def flow_marked_lines(text: str, flags: list[bool], widths: list[float], measure) -> list[tuple[str, list[bool]]] | None:
+    """Wrap on spaces. measure(start, end) is the width of text[start:end]."""
+    spans = _word_spans(text)
+    if not spans:
+        return []
+    if not widths or any(width <= 0 for width in widths):
+        return None
+    lines: list[tuple[int, int]] = []
+    index = 0
+    start = None
+    end = None
+    for word_start, word_end in spans:
+        if index >= len(widths):
+            return None
+        if start is None:
+            if measure(word_start, word_end) > widths[index]:
+                return None
+            start, end = word_start, word_end
+            continue
+        if measure(start, word_end) > widths[index]:
+            lines.append((start, end))
+            index += 1
+            if index >= len(widths) or measure(word_start, word_end) > widths[index]:
+                return None
+            start, end = word_start, word_end
+        else:
+            end = word_end
+    if start is not None:
+        lines.append((start, end))
+    return [(text[left:right], list(flags[left:right])) for left, right in lines]
+
+
+def _flow_force_marked(text: str, flags: list[bool], widths: list[float], measure) -> list[tuple[str, list[bool]]]:
+    """Break long words so the text still lands on the given lines."""
+    if not text or not widths:
+        return []
+    lines: list[tuple[int, int]] = []
+    index = 0
+    start = 0
+    cursor = 0
+    while cursor < len(text) and index < len(widths):
+        if text[cursor] == " " and cursor == start:
+            cursor += 1
+            start = cursor
+            continue
+        if measure(start, cursor + 1) > widths[index] and cursor > start:
+            lines.append((start, cursor))
+            index += 1
+            if text[cursor] == " ":
+                cursor += 1
+            start = cursor
+            continue
+        if measure(start, cursor + 1) > widths[index] and cursor == start:
+            cursor += 1
+            lines.append((start, cursor))
+            index += 1
+            start = cursor
+            continue
+        cursor += 1
+    if start < len(text):
+        if index < len(widths):
+            lines.append((start, len(text)))
+        elif lines:
+            left, _right = lines[-1]
+            lines[-1] = (left, len(text))
+    placed: list[tuple[str, list[bool]]] = []
+    for left, right in lines:
+        while left < right and text[left] == " ":
+            left += 1
+        while right > left and text[right - 1] == " ":
+            right -= 1
+        if left < right:
+            placed.append((text[left:right], list(flags[left:right])))
+    return placed
+
+
+def fit_marked_flow(
+    text: str,
+    flags: list[bool],
+    widths: list[float],
+    max_size: int,
+    measure_for,
+    linespace_for,
+    gap: float,
+    floor: int = 4,
+) -> tuple[int, list[str], list[list[bool]]]:
+    """Like fit_flow, but bold characters use the bold measure."""
+    size = max(floor, int(max_size))
+    if len(flags) != len(text):
+        flags = (list(flags) + [False] * len(text))[: len(text)]
+    if not text:
+        return size, [], []
+
+    def fits(at: int):
+        measure_run = measure_for(at)
+
+        def measure(start: int, end: int, measure_run=measure_run) -> float:
+            return _slice_width(
+                text[start:end],
+                flags[start:end],
+                lambda sample: measure_run(sample, False),
+                lambda sample: measure_run(sample, True),
+            )
+
+        placed = flow_marked_lines(text, flags, widths, measure)
+        if placed is None:
+            return None
+        if len(placed) > 1 and linespace_for(at) > gap + 0.5:
+            return None
+        return placed
+
+    while size > floor:
+        placed = fits(size)
+        if placed is not None:
+            return size, [line for line, _bits in placed], [bits for _line, bits in placed]
+        size -= 1
+    placed = fits(floor)
+    if placed is None:
+        measure_run = measure_for(floor)
+
+        def measure(start: int, end: int, measure_run=measure_run) -> float:
+            return _slice_width(
+                text[start:end],
+                flags[start:end],
+                lambda sample: measure_run(sample, False),
+                lambda sample: measure_run(sample, True),
+            )
+
+        placed = _flow_force_marked(text, flags, widths, measure)
+    return floor, [line for line, _bits in placed], [bits for _line, bits in placed]
+
+
+def _draw_runs(draw: ImageDraw.ImageDraw, x: float, y: float, text: str, flags: list[bool], regular, bold, ink):
+    index = 0
+    while index < len(text):
+        bit = bool(flags[index]) if index < len(flags) else False
+        end = index + 1
+        while end < len(text) and (bool(flags[end]) if end < len(flags) else False) == bit:
+            end += 1
+        chunk = text[index:end]
+        font = bold if bit else regular
+        draw.text((x, y), chunk, font=font, fill=ink, anchor="ls")
+        x += _text_width(draw, chunk, font)
+        index = end
+
+
 def _draw_block(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -211,6 +419,7 @@ def _draw_block(
     dpi_x: float,
     dpi_y: float,
     ink,
+    bold=None,
 ):
     """Wrap one paragraph onto the underlines, shrinking from the chosen size."""
     widths = [max(1, mm_to_px(line["w"], dpi_x)) for line in lines_spec]
@@ -220,27 +429,76 @@ def _draw_block(
         gap = mm_to_px(sum(steps) / len(steps), dpi_y)
     else:
         gap = 10**6
+    cleaned = normalize_flow(text)
+    flags = bold_flags(len(cleaned), bold)
+
+    if not any(flags):
+        def measure_for(size: int):
+            font = _font(size)
+            return lambda sample, font=font: _text_width(draw, sample, font)
+
+        def linespace_for(size: int) -> int:
+            ascent, descent = _line_box(_font(size))
+            return ascent + descent
+
+        px, placed = fit_flow(cleaned, widths, max_px, measure_for, linespace_for, gap, floor=4)
+        font = _font(px)
+        for line, content in zip(lines_spec, placed):
+            if not content:
+                continue
+            use = _shrink_font(draw, content, font, max(1, mm_to_px(line["w"], dpi_x)))
+            draw.text(
+                (mm_to_px(line["x"], dpi_x), mm_to_px(line["y"], dpi_y)),
+                content,
+                font=use,
+                fill=ink,
+                anchor="ls",
+            )
+        return
 
     def measure_for(size: int):
-        font = _font(size)
-        return lambda sample, font=font: _text_width(draw, sample, font)
+        regular = _font(size, False)
+        heavy = _font(size, True)
+
+        def measure(sample: str, is_bold: bool, regular=regular, heavy=heavy) -> float:
+            return _text_width(draw, sample, heavy if is_bold else regular)
+
+        return measure
 
     def linespace_for(size: int) -> int:
-        ascent, descent = _line_box(_font(size))
-        return ascent + descent
+        regular_ascent, regular_descent = _line_box(_font(size, False))
+        bold_ascent, bold_descent = _line_box(_font(size, True))
+        return max(regular_ascent, bold_ascent) + max(regular_descent, bold_descent)
 
-    px, placed = fit_flow(text, widths, max_px, measure_for, linespace_for, gap, floor=4)
-    font = _font(px)
-    for line, content in zip(lines_spec, placed):
+    px, placed, line_flags = fit_marked_flow(
+        cleaned, flags, widths, max_px, measure_for, linespace_for, gap, floor=4,
+    )
+    regular = _font(px, False)
+    heavy = _font(px, True)
+    for line, content, bits in zip(lines_spec, placed, line_flags):
         if not content:
             continue
-        use = _shrink_font(draw, content, font, max(1, mm_to_px(line["w"], dpi_x)))
-        draw.text(
-            (mm_to_px(line["x"], dpi_x), mm_to_px(line["y"], dpi_y)),
+        limit = max(1, mm_to_px(line["w"], dpi_x))
+        use_regular, use_heavy = regular, heavy
+        size = px
+        while size > 4 and _slice_width(
             content,
-            font=use,
-            fill=ink,
-            anchor="ls",
+            bits,
+            lambda sample, font=use_regular: _text_width(draw, sample, font),
+            lambda sample, font=use_heavy: _text_width(draw, sample, font),
+        ) > limit:
+            size -= 1
+            use_regular = _font(size, False)
+            use_heavy = _font(size, True)
+        _draw_runs(
+            draw,
+            mm_to_px(line["x"], dpi_x),
+            mm_to_px(line["y"], dpi_y),
+            content,
+            bits,
+            use_regular,
+            use_heavy,
+            ink,
         )
 
 
@@ -364,6 +622,7 @@ def render_overlay(
     registration: bool = False,
     transparent: bool = True,
     ink_scale: float = 1.0,
+    bold_marks: dict | None = None,
 ) -> Image.Image:
     """RGBA (or RGB) image of the A4 page with only the answers on it."""
     width = max(1, mm_to_px(PAGE_W_MM, dpi_x))
@@ -389,7 +648,16 @@ def render_overlay(
             _draw_centered(draw, raw, spec, dpi_x, dpi_y, ink, ink_scale)
             continue
         if spec.get("block"):
-            _draw_block(draw, raw, spec["lines"], (spec.get("size") or spec["lines"][0]["size"]) * ink_scale, dpi_x, dpi_y, ink)
+            _draw_block(
+                draw,
+                raw,
+                spec["lines"],
+                (spec.get("size") or spec["lines"][0]["size"]) * ink_scale,
+                dpi_x,
+                dpi_y,
+                ink,
+                (bold_marks or {}).get(field_id),
+            )
             continue
         lines_spec = spec["lines"]
         pt = (spec.get("size") or lines_spec[0]["size"]) * ink_scale
@@ -664,6 +932,7 @@ def compose_preview(
     form_page: Image.Image | None = None,
     stamp_align: str = "center",
     ink_scale: float = 1.0,
+    bold_marks: dict | None = None,
 ) -> Image.Image:
     """Screen image: scanned form in the background, answers on top. Not sent to the printer."""
     if form_page is None:
@@ -679,6 +948,7 @@ def compose_preview(
         registration=registration,
         transparent=True,
         ink_scale=ink_scale,
+        bold_marks=bold_marks,
     )
     if overlay.size != form_page.size:
         overlay = overlay.resize(form_page.size, Image.Resampling.LANCZOS)

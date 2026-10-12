@@ -522,6 +522,94 @@ class StationEntry(tk.Entry):
         self.on_pick(label, phone, focus_phone)
 
 
+def _display_bold_chars(widget: tk.Text, display: str) -> list[bool]:
+    flags = [False] * len(display)
+    ranges = widget.tag_ranges("bold")
+    for start, end in zip(ranges[0::2], ranges[1::2]):
+        left = len(widget.get("1.0", str(start)))
+        right = len(widget.get("1.0", str(end)))
+        for index in range(max(0, left), min(len(flags), right)):
+            flags[index] = True
+    return flags
+
+
+def _normalize_display_bold(display: str, bold_at: list[bool]) -> tuple[str, list[bool]]:
+    """Collapse whitespace the same way as the printed paragraph, keeping bold marks."""
+    chars: list[str] = []
+    flags: list[bool] = []
+    index = 0
+    size = len(display)
+    while index < size and display[index].isspace():
+        index += 1
+    while index < size:
+        if display[index].isspace():
+            run = False
+            while index < size and display[index].isspace():
+                if index < len(bold_at) and bold_at[index]:
+                    run = True
+                index += 1
+            if index >= size:
+                break
+            chars.append(" ")
+            flags.append(run)
+            continue
+        chars.append(display[index])
+        flags.append(bool(index < len(bold_at) and bold_at[index]))
+        index += 1
+    return "".join(chars), flags
+
+
+def _display_norm_map(display: str) -> tuple[list[int | None], int]:
+    mapping: list[int | None] = [None] * len(display)
+    norm = 0
+    index = 0
+    size = len(display)
+    while index < size and display[index].isspace():
+        index += 1
+    while index < size:
+        if display[index].isspace():
+            space_at = index
+            while index < size and display[index].isspace():
+                index += 1
+            if index >= size:
+                break
+            mapping[space_at] = norm
+            norm += 1
+            continue
+        mapping[index] = norm
+        norm += 1
+        index += 1
+    return mapping, norm
+
+
+def _norm_pos(mapping: list[int | None], total: int, offset: int) -> int:
+    if offset <= 0:
+        return 0
+    if offset >= len(mapping):
+        return total
+    found = mapping[offset]
+    if found is not None:
+        return found
+    for index in range(offset, len(mapping)):
+        if mapping[index] is not None:
+            return int(mapping[index])
+    return total
+
+
+def _span_is_bold(widget: tk.Text, start: str, end: str) -> bool:
+    if widget.compare(start, ">=", end):
+        return False
+    pos = start
+    while widget.compare(pos, "<", end):
+        if "bold" not in widget.tag_names(pos):
+            return False
+        nxt = widget.index(f"{pos} + 1 char")
+        if widget.compare(nxt, "==", pos):
+            break
+        pos = nxt
+    return True
+
+
 class FormApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -584,6 +672,7 @@ class FormApp(tk.Tk):
         self._konsil_file: Path | None = None
         self._konsil_name = ""
         self._snapshot = ""
+        self._question_bold: list[list[int]] = []
 
         self._build()
         self._load_config()
@@ -616,6 +705,7 @@ class FormApp(tk.Tk):
             text=(
                 "Direkt ins Formular schreiben. Ein Kreis setzt oder löscht das Kreuz. "
                 "Doppelklick auf das Etikett wählt die PDF, Umschalt+Klick setzt seine Ecke. "
+                "Auswahl fett macht markierten Text in der Fragestellung fett, Strg+B ebenso. "
                 "Gedruckt werden nur die Einträge und das Etikett — das Formular selbst bleibt auf dem Papier. "
                 "Drucken öffnet den normalen Druckdialog. Unter Einstellungen: Auftrag → Privater Druck, "
                 "Grundlagen → Quelle Universal. Formulare erst am Gerät in die Universalzufuhr legen "
@@ -651,6 +741,7 @@ class FormApp(tk.Tk):
         ttk.Button(row, text="Felder…", command=self.open_field_settings).pack(side="left", padx=(0, 4))
         ttk.Button(row, text="Beispiel füllen", command=self.fill_example).pack(side="left", padx=4)
         ttk.Button(row, text="Nicht gemerkte leeren", command=self.clear_fields).pack(side="left", padx=4)
+        ttk.Button(row, text="Auswahl fett", command=self._toggle_question_bold).pack(side="left", padx=4)
         ttk.Button(row, text="Neu", command=self.new_konsil).pack(side="left", padx=4)
         ttk.Button(row, text="Speichern", command=self.save_konsil).pack(side="left", padx=4)
         ttk.Button(row, text="Speichern unter…", command=lambda: self.save_konsil(save_as=True)).pack(side="left", padx=4)
@@ -812,13 +903,18 @@ class FormApp(tk.Tk):
             pady=0,
             spacing1=0,
             spacing3=0,
+            exportselection=False,
         )
         widget._flow_key = key
+        widget._bold_hold = None
+        widget.tag_configure("bold", font=("Arial", 10, "bold"))
         widget.tag_configure("flow", lmargin1=0, lmargin2=0)
         widget.tag_add("flow", "1.0", "end")
         self._embed(widget)
         widget.bind("<KeyRelease>", lambda _e, box=widget: self._on_flow_key(box), add="+")
         widget.bind("<<Paste>>", lambda _e, box=widget: box.after(1, lambda: self._on_flow_key(box)), add="+")
+        widget.bind("<Control-b>", self._toggle_question_bold)
+        widget.bind("<Control-B>", self._toggle_question_bold)
         self._flow_chips[key] = []
         self._flow_chip_items[key] = []
         self._flow_photos[key] = []
@@ -1084,7 +1180,9 @@ class FormApp(tk.Tk):
         # Each wrapped line is its own paragraph, so the gap sits below the line.
         widget.configure(spacing3=max(0, int(round(gap_px - linespace))))
         widget._laid_pt = pt
+        widget.tag_configure("bold", font=("Arial", max(1, int(pt)), "bold"))
         widget.tag_add("flow", "1.0", "end")
+        widget.tag_raise("bold")
 
     def _layout_block(self, key: str, spec: dict, editing: bool):
         widget = self._field_inputs.get(key)
@@ -1123,24 +1221,40 @@ class FormApp(tk.Tk):
         height = max(12, offset + span_px + descent + 2)
         self._move_window(widget, left, top, outer_w, height, editing)
 
+        text, flags = self._flow_plain_and_flags(widget, consume_hold=True)
+        if key == "fragestellung":
+            self._question_bold = overlay.bold_ranges(flags)
+        selection = self._flow_selection_norm(widget)
+
         def measure_for(pt: int):
-            font = tkfont.Font(family="Arial", size=max(1, pt))
-            return font.measure
+            regular = tkfont.Font(family="Arial", size=max(1, pt))
+            heavy = tkfont.Font(family="Arial", size=max(1, pt), weight="bold")
+
+            def measure(sample: str, is_bold: bool, regular=regular, heavy=heavy) -> int:
+                return (heavy if is_bold else regular).measure(sample)
+
+            return measure
 
         def linespace_for(pt: int) -> int:
-            return tkfont.Font(family="Arial", size=max(1, pt)).metrics("linespace")
+            regular = tkfont.Font(family="Arial", size=max(1, pt))
+            heavy = tkfont.Font(family="Arial", size=max(1, pt), weight="bold")
+            return max(regular.metrics("linespace"), heavy.metrics("linespace"))
 
-        pt, placed = overlay.fit_flow(
-            widget.get("1.0", "end-1c"),
-            wrap_widths,
-            max_pt,
-            measure_for,
-            linespace_for,
-            gap_px,
-            floor=4,
-        )
+        if any(flags):
+            pt, placed, line_flags = overlay.fit_marked_flow(
+                text, flags, wrap_widths, max_pt, measure_for, linespace_for, gap_px, floor=4,
+            )
+        else:
+            pt, placed = overlay.fit_flow(
+                text, wrap_widths, max_pt,
+                lambda size: (lambda sample, size=size: tkfont.Font(family="Arial", size=max(1, size)).measure(sample)),
+                lambda size: tkfont.Font(family="Arial", size=max(1, size)).metrics("linespace"),
+                gap_px,
+                floor=4,
+            )
+            line_flags = [[False] * len(line) for line in placed]
         self._apply_flow_font(widget, pt, gap_px)
-        self._show_flow_lines(widget, placed, indents)
+        self._show_flow_lines(widget, placed, indents, line_flags, selection)
 
         font_spec = ("Arial", max(1, pt))
         offset = self._text_baseline(font_spec)
@@ -1151,7 +1265,14 @@ class FormApp(tk.Tk):
         self._move_window(widget, left, top, outer_w, height, editing)
         self._place_flow_chips(key, widget, lines, left_mm, top, pad, descent, ascent, editing)
 
-    def _show_flow_lines(self, widget: tk.Text, placed: list[str], indents: list[int]):
+    def _show_flow_lines(
+        self,
+        widget: tk.Text,
+        placed: list[str],
+        indents: list[int],
+        line_flags: list[list[bool]] | None = None,
+        selection: tuple[int, int] | None = None,
+    ):
         """Show the wrapped lines, each starting at its own underline."""
         display = "\n".join(placed)
         current = widget.get("1.0", "end-1c")
@@ -1170,8 +1291,116 @@ class FormApp(tk.Tk):
                 widget.tag_raise(name)
                 if index < count:
                     widget.tag_add(name, f"{index + 1}.0", f"{index + 1}.end")
+            self._apply_line_bold(widget, line_flags or [])
+            if selection is not None:
+                self._restore_flow_selection(widget, placed, selection)
         finally:
             widget._flow_sync = False
+
+    def _apply_line_bold(self, widget: tk.Text, line_flags: list[list[bool]]):
+        widget.tag_remove("bold", "1.0", "end")
+        for line_no, bits in enumerate(line_flags, start=1):
+            column = 0
+            while column < len(bits):
+                if not bits[column]:
+                    column += 1
+                    continue
+                end = column + 1
+                while end < len(bits) and bits[end]:
+                    end += 1
+                widget.tag_add("bold", f"{line_no}.{column}", f"{line_no}.{end}")
+                column = end
+        widget.tag_raise("bold")
+
+    def _flow_plain_and_flags(self, widget: tk.Text, *, consume_hold: bool) -> tuple[str, list[bool]]:
+        display = widget.get("1.0", "end-1c")
+        hold = getattr(widget, "_bold_hold", None)
+        if hold is not None:
+            text = overlay.normalize_flow(display)
+            if consume_hold:
+                widget._bold_hold = None
+            return text, overlay.bold_flags(len(text), hold)
+        return _normalize_display_bold(display, _display_bold_chars(widget, display))
+
+    def _flow_selection_norm(self, widget: tk.Text) -> tuple[int, int] | None:
+        try:
+            start = widget.index("sel.first")
+            end = widget.index("sel.last")
+        except tk.TclError:
+            return None
+        display = widget.get("1.0", "end-1c")
+        mapping, total = _display_norm_map(display)
+        left = _norm_pos(mapping, total, len(widget.get("1.0", start)))
+        right = _norm_pos(mapping, total, len(widget.get("1.0", end)))
+        if right <= left:
+            return None
+        return left, right
+
+    def _restore_flow_selection(self, widget: tk.Text, placed: list[str], selection: tuple[int, int]):
+        start, end = selection
+        if end <= start:
+            return
+        points: dict[str, tuple[int, int]] = {}
+        pos = 0
+        for line_no, line in enumerate(placed, start=1):
+            for column in range(len(line) + 1):
+                if pos == start and "start" not in points:
+                    points["start"] = (line_no, column)
+                if pos == end and "end" not in points:
+                    points["end"] = (line_no, column)
+                if column < len(line):
+                    pos += 1
+            if line_no < len(placed):
+                pos += 1
+        if pos == start and "start" not in points and placed:
+            points["start"] = (len(placed), len(placed[-1]))
+        if pos == end and "end" not in points and placed:
+            points["end"] = (len(placed), len(placed[-1]))
+        if "start" not in points or "end" not in points:
+            return
+        widget.tag_add(
+            "sel",
+            f"{points['start'][0]}.{points['start'][1]}",
+            f"{points['end'][0]}.{points['end'][1]}",
+        )
+        widget.tag_raise("sel")
+
+    def _toggle_question_bold(self, _event=None):
+        widget = self._field_inputs.get("fragestellung")
+        if not isinstance(widget, tk.Text):
+            return "break"
+        try:
+            start = widget.index("sel.first")
+            end = widget.index("sel.last")
+        except tk.TclError:
+            self.cursor_info.set("In der Fragestellung Text markieren, dann Fett oder Strg+B.")
+            return "break"
+        if _span_is_bold(widget, start, end):
+            widget.tag_remove("bold", start, end)
+            self.cursor_info.set("Markierung in der Fragestellung ist nicht mehr fett.")
+        else:
+            widget.tag_add("bold", start, end)
+            widget.tag_raise("bold")
+            self.cursor_info.set("Markierung in der Fragestellung ist fett.")
+        self.schedule()
+        return "break"
+
+    def _question_bold_ranges(self) -> list[list[int]]:
+        widget = self._field_inputs.get("fragestellung")
+        if isinstance(widget, tk.Text):
+            _text, flags = self._flow_plain_and_flags(widget, consume_hold=False)
+            return overlay.bold_ranges(flags)
+        return [list(item) for item in self._question_bold]
+
+    def _hold_question_bold(self, ranges) -> None:
+        widget = self._field_inputs.get("fragestellung")
+        text = ""
+        if isinstance(widget, tk.Text):
+            text = overlay.normalize_flow(widget.get("1.0", "end-1c"))
+        cleaned = overlay.bold_ranges(overlay.bold_flags(len(text), ranges or []))
+        self._question_bold = cleaned
+        if isinstance(widget, tk.Text):
+            widget._bold_hold = cleaned
 
     def _move_flow_cursor(self, widget: tk.Text, display: str, index: int):
         index = max(0, min(index, len(display.replace("\n", " "))))
@@ -1550,6 +1779,7 @@ class FormApp(tk.Tk):
             if flat:
                 widget.insert("1.0", flat)
             widget.tag_add("flow", "1.0", "end")
+            widget._bold_hold = None
             return
         lines = self._lines.get(key)
         if lines:
@@ -1657,6 +1887,10 @@ class FormApp(tk.Tk):
                 form_page=self._form_page,
                 stamp_align=align,
                 ink_scale=self._ink_factor(),
+                bold_marks=(
+                    {"fragestellung": self._question_bold_ranges()}
+                    if self.show_marks.get() else None
+                ),
             )
         except Exception as exc:
             self.cursor_info.set(f"Vorschau: {exc}")
@@ -2040,6 +2274,8 @@ class FormApp(tk.Tk):
             self.begleit.set("")
         if not self._kept("stamp_path"):
             self.stamp_path.set("")
+        if not self._kept("fragestellung"):
+            self._question_bold = []
         self._note_station()
         self.schedule()
 
@@ -2064,6 +2300,7 @@ class FormApp(tk.Tk):
             "remember": {key: var.get() for key, var in self.remember.items()},
             "zoom": self._zoom,
             "ink": self._ink,
+            "fragestellung_bold": self._question_bold_ranges(),
         }
 
     def _apply_payload(self, data: dict, only_remembered: bool = False):
@@ -2103,6 +2340,10 @@ class FormApp(tk.Tk):
             for key in TEXT_FIELDS:
                 if key in values and keep(key):
                     self._set_value(key, str(values[key]))
+            if keep("fragestellung"):
+                self._hold_question_bold(data.get("fragestellung_bold"))
+            else:
+                self._question_bold = []
             bools = data.get("bools") or {}
             for key, var in self.bools.items():
                 if key not in bools:
@@ -2569,6 +2810,8 @@ class FormApp(tk.Tk):
             data["begleit"] = ""
         if not self._kept("stamp_path"):
             data["stamp_path"] = ""
+        if not self._kept("fragestellung"):
+            data["fragestellung_bold"] = []
         return data
 
     def _save_config(self):
@@ -2624,6 +2867,7 @@ class FormApp(tk.Tk):
             registration=registration,
             transparent=False,
             ink_scale=max(1.0, min(2.0, float(payload.get("ink", 100)) / 100.0)),
+            bold_marks=None if registration else {"fragestellung": payload.get("fragestellung_bold") or []},
         )
         if registration:
             draw = ImageDraw.Draw(image)
