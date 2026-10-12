@@ -3,6 +3,7 @@ build/
 dist/
 config.json
 konsile/
+etiketten/
 _qa_*.png
 _form_*.png
 _crop_*.png

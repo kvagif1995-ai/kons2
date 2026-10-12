@@ -6,12 +6,13 @@ the marks and the chosen label PDF. Put the blank paper forms in the tray.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sys
 import threading
 import tkinter as tk
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
@@ -44,6 +45,186 @@ def _stored_etikett(data: dict, folder: Path) -> str:
     return str(data.get("stamp_path") or "").strip()
 
 
+def _parse_stamp_time(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _etikett_caption(path: Path) -> str:
+    """Patient lines from the label PDF. Empty when the PDF has no text."""
+    text = ""
+    try:
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(str(path))
+        try:
+            textpage = pdf[0].get_textpage()
+            try:
+                text = textpage.get_text_bounded() or ""
+            finally:
+                textpage.close()
+        finally:
+            pdf.close()
+    except Exception:
+        text = ""
+    lines: list[str] = []
+    for raw in str(text).replace("\r", "\n").split("\n"):
+        line = " ".join(raw.split())
+        if not line:
+            continue
+        lines.append(line)
+        if len(lines) >= 3:
+            break
+    caption = " · ".join(lines)
+    if len(caption) > 140:
+        caption = caption[:137].rstrip() + "…"
+    return caption
+
+
+def _etikett_title(path: Path, source_name: str, hint: str = "") -> str:
+    """Prefer the text printed on the label, then the Konsil name, then the file name."""
+    caption = _etikett_caption(path)
+    if caption:
+        return caption
+    hint = " ".join(hint.split())
+    if hint:
+        return hint[:140]
+    stem = Path(source_name).stem
+    if stem.endswith(".etikett"):
+        stem = stem[: -len(".etikett")]
+    return stem or "Etikett"
+
+
+def _read_etikett_index() -> list[dict]:
+    if not ETIKETT_INDEX.is_file():
+        return []
+    try:
+        data = json.loads(ETIKETT_INDEX.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [row for row in data if isinstance(row, dict) and row.get("id") and row.get("file")]
+
+
+def _write_etikett_index(rows: list[dict]) -> None:
+    ETIKETT_DIR.mkdir(exist_ok=True)
+    ETIKETT_INDEX.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _purge_etiketten(rows: list[dict] | None = None) -> list[dict]:
+    """Drop labels last used more than three months ago, and files with no index entry."""
+    if rows is None:
+        rows = _read_etikett_index()
+    cutoff = datetime.now() - timedelta(days=ETIKETT_DAYS)
+    kept: list[dict] = []
+    seen: set[str] = set()
+    for row in rows:
+        name = str(row.get("file") or "")
+        if not name or Path(name).name != name:
+            continue
+        used = _parse_stamp_time(str(row.get("used_at") or ""))
+        path = ETIKETT_DIR / name
+        if used is None or used < cutoff or not path.is_file():
+            if path.is_file():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        kept.append(row)
+    if ETIKETT_DIR.is_dir():
+        for path in ETIKETT_DIR.glob("*.pdf"):
+            if path.name not in seen:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    kept.sort(key=lambda row: str(row.get("used_at") or ""), reverse=True)
+    return kept
+
+
+def remember_etikett(
+    source: Path,
+    *,
+    touch: bool = True,
+    used_at: datetime | None = None,
+    label_hint: str = "",
+) -> Path | None:
+    """Keep one copy of a used label for three months. The same file updates its date."""
+    if not source.is_file():
+        return None
+    when = used_at or datetime.now().replace(second=0, microsecond=0)
+    cutoff = datetime.now() - timedelta(days=ETIKETT_DAYS)
+    try:
+        digest = _sha256_file(source)
+        ETIKETT_DIR.mkdir(exist_ok=True)
+        rows = _purge_etiketten()
+    except OSError:
+        return None
+    file_name = f"{digest[:32]}.pdf"
+    dest = ETIKETT_DIR / file_name
+    existing = next((row for row in rows if row.get("id") == digest), None)
+    if existing is None and when < cutoff:
+        return None
+    try:
+        same = dest.is_file() and source.resolve() == dest.resolve()
+    except OSError:
+        same = False
+    if not same and (not dest.is_file() or existing is None):
+        try:
+            shutil.copyfile(source, dest)
+        except OSError:
+            return None
+    if existing is None:
+        rows.insert(0, {
+            "id": digest,
+            "file": file_name,
+            "label": _etikett_title(dest, source.name, label_hint),
+            "source": source.name,
+            "used_at": when.isoformat(timespec="minutes"),
+        })
+    elif touch:
+        previous = _parse_stamp_time(str(existing.get("used_at") or ""))
+        if previous is None or when > previous:
+            existing["used_at"] = when.isoformat(timespec="minutes")
+        titled = _etikett_title(dest, source.name, label_hint)
+        current = str(existing.get("label") or "")
+        if titled and (not current or current == Path(str(existing.get("source") or "")).stem):
+            existing["label"] = titled
+    rows.sort(key=lambda row: str(row.get("used_at") or ""), reverse=True)
+    try:
+        _write_etikett_index(rows)
+    except OSError:
+        return dest if dest.is_file() else None
+    return dest
+
+
+def import_konsil_etiketten() -> None:
+    """Bring labels already stored beside Konsils into the three-month list."""
+    if not KONSIL_DIR.is_dir():
+        return
+    for path in KONSIL_DIR.glob("*.etikett.pdf"):
+        try:
+            used = datetime.fromtimestamp(path.stat().st_mtime).replace(second=0, microsecond=0)
+        except OSError:
+            continue
+        remember_etikett(path, touch=False, used_at=used)
+
+
 def _install_dir() -> Path:
     """Folder the user runs. Settings stay beside the exe."""
     if getattr(sys, "frozen", False):
@@ -54,6 +235,9 @@ def _install_dir() -> Path:
 ROOT = _install_dir()
 CONFIG_PATH = ROOT / "config.json"
 KONSIL_DIR = ROOT / "konsile"
+ETIKETT_DIR = ROOT / "etiketten"
+ETIKETT_INDEX = ETIKETT_DIR / "index.json"
+ETIKETT_DAYS = 90
 PREVIEW_DPI = 120
 
 # Filled on almost every form. Highlighted until the user turns that off.
@@ -403,6 +587,7 @@ class FormApp(tk.Tk):
 
         self._build()
         self._load_config()
+        self.after(200, self._keep_etiketten)
         self._snapshot = self._form_snapshot()
         self._refresh_title()
         self._refresh_printers()
@@ -481,6 +666,7 @@ class FormApp(tk.Tk):
         ttk.Label(stamp, text="Etikett").pack(side="left")
         ttk.Entry(stamp, textvariable=self.stamp_path).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Button(stamp, text="Wählen…", command=self.browse_stamp).pack(side="left")
+        ttk.Button(stamp, text="Gespeicherte…", command=self.open_saved_etikett).pack(side="left", padx=(6, 0))
         ttk.Button(stamp, text="Entfernen", command=lambda: self.stamp_path.set("")).pack(side="left", padx=(6, 8))
         ttk.Radiobutton(stamp, text="Originalgröße", variable=self.stamp_mode, value="native").pack(side="left")
         ttk.Radiobutton(stamp, text="einpassen", variable=self.stamp_mode, value="fit").pack(side="left", padx=(6, 8))
@@ -1595,6 +1781,33 @@ class FormApp(tk.Tk):
             f"Korrektur verschiebt nur den Ausdruck, nicht die Vorschau."
         )
 
+    def _keep_etiketten(self):
+        try:
+            import_konsil_etiketten()
+            if ETIKETT_DIR.is_dir():
+                _write_etikett_index(_purge_etiketten())
+        except OSError:
+            pass
+
+    def _remember_stamp(self, path_text: str, *, warn: bool, label_hint: str = "") -> str:
+        """Copy a chosen label into the three-month archive and return the path to use."""
+        text = path_text.strip()
+        if not text:
+            return ""
+        source = Path(text)
+        if not source.is_file():
+            return text
+        kept = remember_etikett(source, label_hint=label_hint)
+        if kept is None:
+            if warn:
+                messagebox.showwarning(
+                    "Etikett",
+                    "Das Etikett konnte nicht für die nächsten 3 Monate gespeichert werden.\n"
+                    "Für dieses Konsil wird weiter die gewählte Datei verwendet.",
+                )
+            return text
+        return str(kept)
+
     def browse_stamp(self):
         path = filedialog.askopenfilename(
             title="Etikett-PDF",
@@ -1602,7 +1815,163 @@ class FormApp(tk.Tk):
             initialdir=str(ROOT),
         )
         if path:
-            self.stamp_path.set(path)
+            self.stamp_path.set(self._remember_stamp(path, warn=True))
+
+    def open_saved_etikett(self):
+        try:
+            rows = _purge_etiketten()
+            _write_etikett_index(rows)
+        except OSError as exc:
+            messagebox.showerror("Etiketten", str(exc))
+            return
+        win = tk.Toplevel(self)
+        win.title("Gespeicherte Etiketten")
+        win.transient(self)
+        win.grab_set()
+        win.geometry("640x480")
+        win.minsize(480, 320)
+        ttk.Label(win, text="Etiketten der letzten 3 Monate").pack(anchor="w", padx=12, pady=(12, 0))
+        ttk.Label(
+            win,
+            style="Hint.TLabel",
+            text="Dieselbe Patientenetikette bleibt erhalten, auch wenn das Konsil gelöscht wird. Doppelklick übernimmt sie.",
+        ).pack(anchor="w", padx=12, pady=(2, 6))
+
+        search_var = tk.StringVar()
+        search = ttk.Entry(win, textvariable=search_var)
+        search.pack(fill="x", padx=12, pady=(0, 6))
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=12)
+        canvas = tk.Canvas(frame, highlightthickness=0, bg="white", bd=0)
+        scroll = ttk.Scrollbar(frame, command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg="white")
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def fit_inner(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 0, 0))
+            if event is None or event.widget is canvas:
+                width = canvas.winfo_width()
+                if width > 1:
+                    canvas.itemconfigure(window_id, width=width)
+
+        inner.bind("<Configure>", fit_inner)
+        canvas.bind("<Configure>", fit_inner)
+
+        def on_wheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
+
+        shown: list[dict] = []
+        selected = {"index": 0}
+
+        def paint_selection():
+            for index, entry in enumerate(shown):
+                bg = "#d6eef4" if index == selected["index"] else "white"
+                entry["row"].configure(bg=bg)
+                entry["name"].configure(bg=bg)
+
+        def select(index: int):
+            if not shown:
+                return
+            selected["index"] = max(0, min(index, len(shown) - 1))
+            paint_selection()
+            canvas.focus_set()
+
+        def filtered() -> list[dict]:
+            needle = " ".join(search_var.get().casefold().split())
+            if not needle:
+                return list(rows)
+            picked = []
+            for row in rows:
+                hay = " ".join(
+                    str(row.get(key) or "") for key in ("label", "source", "used_at")
+                ).casefold()
+                if needle in hay:
+                    picked.append(row)
+            return picked
+
+        def build_rows(prefer: int = 0):
+            for child in inner.winfo_children():
+                child.destroy()
+            shown.clear()
+            matches = filtered()
+            if not matches:
+                tk.Label(
+                    inner,
+                    text="Keine Etiketten in den letzten 3 Monaten." if not rows else "Nichts passt zur Suche.",
+                    bg="white",
+                    fg="#5c6b73",
+                    font=("Segoe UI", 11),
+                ).pack(anchor="w", padx=8, pady=8)
+                canvas.after_idle(fit_inner)
+                return
+            for index, row in enumerate(matches):
+                used = _parse_stamp_time(str(row.get("used_at") or ""))
+                when = used.strftime("%d.%m.%Y %H:%M") if used else ""
+                label = str(row.get("label") or row.get("source") or "Etikett")
+                line = tk.Frame(inner, bg="white")
+                line.pack(fill="x")
+                name = tk.Label(
+                    line,
+                    text=f"{label}    {when}",
+                    anchor="w",
+                    bg="white",
+                    font=("Segoe UI", 11),
+                    justify="left",
+                )
+                name.pack(side="left", fill="x", expand=True, padx=(8, 8), pady=3)
+                entry = {"row": line, "name": name, "data": row}
+                shown.append(entry)
+
+                def bind_row(widget, item=index):
+                    widget.bind("<Button-1>", lambda _e, i=item: select(i))
+                    widget.bind("<Double-Button-1>", lambda _e, i=item: do_use_index(i))
+                    widget.bind("<MouseWheel>", on_wheel)
+
+                bind_row(line)
+                bind_row(name)
+            select(prefer)
+            canvas.after_idle(fit_inner)
+
+        canvas.bind("<MouseWheel>", on_wheel)
+        search.bind("<Return>", lambda _e: do_use())
+
+        def do_use_index(index: int):
+            if index < 0 or index >= len(shown):
+                return
+            row = shown[index]["data"]
+            name = str(row.get("file") or "")
+            path = ETIKETT_DIR / name
+            if not path.is_file():
+                messagebox.showerror("Etikett", "Diese Etikette ist nicht mehr da.", parent=win)
+                return
+            kept = remember_etikett(path)
+            win.destroy()
+            self.stamp_path.set(str(kept or path))
+
+        def do_use(_event=None):
+            if shown:
+                do_use_index(selected["index"])
+
+        def on_search(*_args):
+            build_rows(0)
+
+        search_var.trace_add("write", on_search)
+
+        buttons = ttk.Frame(win)
+        buttons.pack(fill="x", padx=12, pady=12)
+        ttk.Button(buttons, text="Übernehmen", command=do_use).pack(side="left")
+        ttk.Button(buttons, text="Schließen", command=win.destroy).pack(side="right")
+        canvas.bind("<Return>", do_use)
+        canvas.bind("<Up>", lambda _e: select(selected["index"] - 1))
+        canvas.bind("<Down>", lambda _e: select(selected["index"] + 1))
+        build_rows(0)
+        search.focus_set()
+        win.wait_window()
 
     def fill_example(self):
         sample = {
@@ -1797,7 +2166,7 @@ class FormApp(tk.Tk):
         self._snapshot = self._form_snapshot()
         self._refresh_title()
 
-    def _store_etikett(self, json_path: Path) -> str | None:
+    def _store_etikett(self, json_path: Path, label_hint: str = "") -> str | None:
         """Copy the label next to the Konsil. None means the save stops."""
         dest = _etikett_file(json_path)
         source_text = self.stamp_path.get().strip()
@@ -1810,6 +2179,7 @@ class FormApp(tk.Tk):
                     return None
             return ""
         source = Path(source_text)
+        self._remember_stamp(source_text, warn=True, label_hint=label_hint)
         if not source.is_file():
             messagebox.showerror(
                 "Speichern",
@@ -1860,7 +2230,7 @@ class FormApp(tk.Tk):
                     f"„{name}“ gibt es schon. Ersetzen?",
                 ):
                     return False
-        stored = self._store_etikett(path)
+        stored = self._store_etikett(path, label_hint=name)
         if stored is None:
             return False
         payload = self._payload()
@@ -2297,6 +2667,10 @@ class FormApp(tk.Tk):
         self.printer.set(choice.printer_name)
         self.copies.set(str(choice.reported_copies))
         self._update_paper_info()
+        if not registration:
+            kept = self._remember_stamp(self.stamp_path.get(), warn=False)
+            if kept:
+                self.stamp_path.set(kept)
         payload = self._payload()
         self._printing = True
         self.print_button.configure(state="disabled")
