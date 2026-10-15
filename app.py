@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import sys
 import threading
@@ -60,8 +61,13 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _etikett_caption(path: Path) -> str:
-    """Patient lines from the label PDF. Empty when the PDF has no text."""
+_NAME_SKIP = {
+    "landgericht", "amtsgericht", "forensik", "strasse", "straße", "str",
+    "weg", "platz", "allee", "ring", "gasse", "am", "an", "der", "die", "das",
+}
+
+
+def _etikett_lines(path: Path) -> list[str]:
     text = ""
     try:
         import pypdfium2 as pdfium
@@ -76,19 +82,84 @@ def _etikett_caption(path: Path) -> str:
         finally:
             pdf.close()
     except Exception:
-        text = ""
+        return []
     lines: list[str] = []
     for raw in str(text).replace("\r", "\n").split("\n"):
         line = " ".join(raw.split())
-        if not line:
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _person_line(line: str) -> bool:
+    """A patient name, not the address or the case number printed above it."""
+    if any(ch.isdigit() for ch in line) or any(ch in line for ch in ".;:/" ):
+        return False
+    words = [word for word in line.replace(",", " ").split() if word]
+    if not 2 <= len(words) <= 4:
+        return False
+    for word in words:
+        plain = word.casefold().strip("-'")
+        if not plain or plain in _NAME_SKIP:
+            return False
+        if not all(ch.isalpha() or ch in "-'" for ch in word):
+            return False
+    return True
+
+
+def _etikett_caption(path: Path) -> str:
+    """Patient name and birth date from the label. Empty when neither is found."""
+    lines = _etikett_lines(path)
+    name = ""
+    born = ""
+    for line in lines:
+        if not born:
+            found = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", line)
+            if found:
+                born = found.group(0)
+        if not name and _person_line(line):
+            name = line
+    if name and born:
+        return f"{name}  geb. {born}"
+    return name
+
+
+def _etikett_preview(path: Path, height: int = 170) -> Image.Image | None:
+    """Small picture of the sticker itself, without the empty page around it."""
+    try:
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(str(path))
+        try:
+            rendered = pdf[0].render(scale=1.3, fill_color=(255, 255, 255, 0)).to_pil().convert("RGBA")
+        finally:
+            pdf.close()
+        trimmed = overlay._trim_content(rendered, 8)
+        plate = Image.new("RGB", trimmed.size, "white")
+        plate.paste(trimmed, mask=trimmed.getchannel("A"))
+        if plate.height > height:
+            width = max(1, int(round(plate.width * height / plate.height)))
+            plate = plate.resize((width, height), Image.Resampling.LANCZOS)
+        if plate.width > 360:
+            next_h = max(1, int(round(plate.height * 360 / plate.width)))
+            plate = plate.resize((360, next_h), Image.Resampling.LANCZOS)
+        return plate
+    except Exception:
+        return None
+
+
+def _refresh_etikett_names(rows: list[dict]) -> None:
+    """Replace an address caption with the patient name when the PDF has one."""
+    for row in rows:
+        file_name = str(row.get("file") or "")
+        if not file_name or Path(file_name).name != file_name:
             continue
-        lines.append(line)
-        if len(lines) >= 3:
-            break
-    caption = " · ".join(lines)
-    if len(caption) > 140:
-        caption = caption[:137].rstrip() + "…"
-    return caption
+        path = ETIKETT_DIR / file_name
+        if not path.is_file():
+            continue
+        caption = _etikett_caption(path)
+        if caption:
+            row["label"] = caption
 
 
 def _etikett_title(path: Path, source_name: str, hint: str = "") -> str:
@@ -201,10 +272,14 @@ def remember_etikett(
         previous = _parse_stamp_time(str(existing.get("used_at") or ""))
         if previous is None or when > previous:
             existing["used_at"] = when.isoformat(timespec="minutes")
-        titled = _etikett_title(dest, source.name, label_hint)
-        current = str(existing.get("label") or "")
-        if titled and (not current or current == Path(str(existing.get("source") or "")).stem):
-            existing["label"] = titled
+        caption = _etikett_caption(dest)
+        if caption:
+            existing["label"] = caption
+        else:
+            titled = _etikett_title(dest, source.name, label_hint)
+            current = str(existing.get("label") or "")
+            if titled and (not current or current == Path(str(existing.get("source") or "")).stem):
+                existing["label"] = titled
     rows.sort(key=lambda row: str(row.get("used_at") or ""), reverse=True)
     try:
         _write_etikett_index(rows)
@@ -2019,7 +2094,9 @@ class FormApp(tk.Tk):
         try:
             import_konsil_etiketten()
             if ETIKETT_DIR.is_dir():
-                _write_etikett_index(_purge_etiketten())
+                rows = _purge_etiketten()
+                _refresh_etikett_names(rows)
+                _write_etikett_index(rows)
         except OSError:
             pass
 
@@ -2054,6 +2131,7 @@ class FormApp(tk.Tk):
     def open_saved_etikett(self):
         try:
             rows = _purge_etiketten()
+            _refresh_etikett_names(rows)
             _write_etikett_index(rows)
         except OSError as exc:
             messagebox.showerror("Etiketten", str(exc))
@@ -2062,13 +2140,13 @@ class FormApp(tk.Tk):
         win.title("Gespeicherte Etiketten")
         win.transient(self)
         win.grab_set()
-        win.geometry("640x480")
-        win.minsize(480, 320)
+        win.geometry("860x620")
+        win.minsize(640, 400)
         ttk.Label(win, text="Etiketten der letzten 3 Monate").pack(anchor="w", padx=12, pady=(12, 0))
         ttk.Label(
             win,
             style="Hint.TLabel",
-            text="Dieselbe Patientenetikette bleibt erhalten, auch wenn das Konsil gelöscht wird. Doppelklick übernimmt sie.",
+            text="Name und Vorschau, damit dieselbe Patientenetikette wieder gewählt werden kann. Doppelklick übernimmt sie.",
         ).pack(anchor="w", padx=12, pady=(2, 6))
 
         search_var = tk.StringVar()
@@ -2102,11 +2180,17 @@ class FormApp(tk.Tk):
         shown: list[dict] = []
         selected = {"index": 0}
 
+        photos: list[ImageTk.PhotoImage] = []
+
         def paint_selection():
             for index, entry in enumerate(shown):
                 bg = "#d6eef4" if index == selected["index"] else "white"
                 entry["row"].configure(bg=bg)
+                entry["text"].configure(bg=bg)
                 entry["name"].configure(bg=bg)
+                entry["when"].configure(bg=bg)
+                if entry["picture"] is not None:
+                    entry["picture"].configure(bg=bg)
 
         def select(index: int):
             if not shown:
@@ -2149,16 +2233,43 @@ class FormApp(tk.Tk):
                 label = str(row.get("label") or row.get("source") or "Etikett")
                 line = tk.Frame(inner, bg="white")
                 line.pack(fill="x")
+                picture = None
+                file_name = str(row.get("file") or "")
+                preview = _etikett_preview(ETIKETT_DIR / file_name) if file_name else None
+                if preview is not None:
+                    photo = ImageTk.PhotoImage(preview)
+                    photos.append(photo)
+                    picture = tk.Label(line, image=photo, bg="white", bd=1, relief="solid")
+                    picture.pack(side="left", padx=(8, 8), pady=6)
+                text = tk.Frame(line, bg="white")
+                text.pack(side="left", fill="both", expand=True, pady=6)
                 name = tk.Label(
-                    line,
-                    text=f"{label}    {when}",
+                    text,
+                    text=label,
                     anchor="w",
                     bg="white",
-                    font=("Segoe UI", 11),
+                    fg="#142028",
+                    font=("Segoe UI", 12, "bold"),
                     justify="left",
                 )
-                name.pack(side="left", fill="x", expand=True, padx=(8, 8), pady=3)
-                entry = {"row": line, "name": name, "data": row}
+                name.pack(anchor="w", fill="x", padx=(0, 8))
+                stamp = tk.Label(
+                    text,
+                    text=when,
+                    anchor="w",
+                    bg="white",
+                    fg="#5c6b73",
+                    font=("Segoe UI", 10),
+                )
+                stamp.pack(anchor="w", fill="x", padx=(0, 8), pady=(2, 0))
+                entry = {
+                    "row": line,
+                    "text": text,
+                    "name": name,
+                    "when": stamp,
+                    "picture": picture,
+                    "data": row,
+                }
                 shown.append(entry)
 
                 def bind_row(widget, item=index):
@@ -2167,7 +2278,11 @@ class FormApp(tk.Tk):
                     widget.bind("<MouseWheel>", on_wheel)
 
                 bind_row(line)
+                bind_row(text)
                 bind_row(name)
+                bind_row(stamp)
+                if picture is not None:
+                    bind_row(picture)
             select(prefer)
             canvas.after_idle(fit_inner)
 
@@ -3001,13 +3116,7 @@ class FormApp(tk.Tk):
                 text += "\nSeiten davor liegen schon im Auftrag."
             tell("error", text)
         else:
-            note = ""
-            if choice.reported_copies > 1 and choice.page_loops == 1:
-                note = (
-                    f" Im Druckdialog stehen {choice.reported_copies} Exemplare, "
-                    "der Drucker wiederholt den ganzen Auftrag also."
-                )
-            tell("info", f"{sheets} Seiten in einem Auftrag an {choice.printer_name} gesendet.{note}")
+            tell("info", f"{sheets} Seiten in einem Auftrag an {choice.printer_name} gesendet.")
         finally:
             if session is not None:
                 try:

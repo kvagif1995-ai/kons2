@@ -26,6 +26,8 @@ _PD_RETURNDEFAULT = 0x00000400
 _PD_USEDEVMODECOPIESANDCOLLATE = 0x00040000
 _PD_HIDEPRINTTOFILE = 0x00100000
 _DM_COPIES = 0x00000100
+_DM_OUT_BUFFER = 2
+_DM_IN_BUFFER = 8
 _GMEM_MOVEABLE = 0x0002
 _MM_TEXT = 1
 
@@ -241,6 +243,70 @@ def _devmode_used(blob: bytes) -> bytes:
     return blob[:used]
 
 
+def _copy_count(devmode: bytes) -> int:
+    """Public dmCopies. 1 when the driver did not fill that field."""
+    if len(devmode) < 88:
+        return 1
+    fields = struct.unpack_from("<I", devmode, 72)[0]
+    if not (fields & _DM_COPIES):
+        return 1
+    return max(1, struct.unpack_from("<h", devmode, 86)[0])
+
+
+def _with_copy_count(devmode: bytes, copies: int) -> bytes:
+    if len(devmode) < 88:
+        return devmode
+    data = bytearray(devmode)
+    fields = struct.unpack_from("<I", data, 72)[0] | _DM_COPIES
+    struct.pack_into("<I", data, 72, fields)
+    struct.pack_into("<h", data, 86, max(1, int(copies)))
+    return bytes(data)
+
+
+def _driver_single_copy(printer_name: str, devmode: bytes) -> bytes:
+    """Same driver settings, but one copy.
+
+    The app draws every extra sheet itself. Leaving dmCopies above 1 would
+    make a driver that does honor it print the loop again.
+    """
+    patched = _with_copy_count(devmode, 1)
+    if not printer_name:
+        return patched
+    winspool = ctypes.WinDLL("winspool.drv", use_last_error=True)
+    winspool.DocumentPropertiesW.argtypes = [
+        wintypes.HWND, wintypes.HANDLE, wintypes.LPCWSTR,
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    winspool.DocumentPropertiesW.restype = ctypes.c_long
+    try:
+        handle = win32print.OpenPrinter(printer_name)
+    except Exception:
+        return patched
+    try:
+        printer = int(handle)
+        needed = winspool.DocumentPropertiesW(None, printer, printer_name, None, None, 0)
+        if needed <= 0:
+            return patched
+        output = ctypes.create_string_buffer(max(needed, len(patched)))
+        source = ctypes.create_string_buffer(patched, len(patched))
+        written = winspool.DocumentPropertiesW(
+            None,
+            printer,
+            printer_name,
+            output,
+            source,
+            _DM_IN_BUFFER | _DM_OUT_BUFFER,
+        )
+        if written < 0:
+            return patched
+        merged = _devmode_used(output.raw[: max(written, needed)])
+        return _with_copy_count(merged or patched, 1)
+    except Exception:
+        return patched
+    finally:
+        win32print.ClosePrinter(handle)
+
+
 def ask_print(owner_hwnd: int, printer_name: str, copies: int) -> PrintChoice | None:
     """Show the standard print dialog. None means the user cancelled."""
     dialog = _PRINTDLGW()
@@ -285,13 +351,16 @@ def ask_print(owner_hwnd: int, printer_name: str, copies: int) -> PrintChoice | 
         chosen = _device_from_devnames(_global_bytes(dialog.hDevNames)) or printer_name
         if not devmode or not chosen:
             raise OSError("Der Druckdialog hat keine Druckereinstellung zurückgegeben.")
+        # Drivers that claim to repeat a job often still emit one sheet when the
+        # app draws the page itself. Always draw that many sheets here, and hand
+        # the driver a one-copy DEVMODE so it does not repeat them a second time.
+        dialog_copies = max(1, int(dialog.nCopies or 1))
         if dialog.Flags & _PD_USEDEVMODECOPIESANDCOLLATE:
-            reported = max(1, struct.unpack_from("<h", devmode, 86)[0]) if len(devmode) >= 88 else 1
-            loops = 1
+            copies = max(_copy_count(devmode), dialog_copies)
         else:
-            loops = max(1, int(dialog.nCopies or 1))
-            reported = loops
-        return PrintChoice(chosen, devmode, loops, reported)
+            copies = dialog_copies
+        devmode = _driver_single_copy(chosen, devmode)
+        return PrintChoice(chosen, devmode, copies, copies)
     finally:
         if dialog.hDC:
             gdi.DeleteDC(dialog.hDC)
