@@ -381,6 +381,11 @@ CAPTIONS = {
     "verw_datum": "Lohr a. Main, den",
     "verw_name": "Name Verwaltung",
 }
+# Paste this into ChatGPT. 350 characters stays at full size on the four underlines.
+FRAGESTELLUNG_TIP = (
+    "Fragestellung auf Deutsch. Höchstens 350 Zeichen, etwa 45 Wörter. "
+    "Kein einzelnes Wort länger als 70 Zeichen."
+)
 MARK_GROUPS = {
     "infekt": ("infekt_ja", "infekt_nein", "infekt_nicht"),
     "risiken": RISK_KEYS,
@@ -822,6 +827,16 @@ class FormApp(tk.Tk):
         ttk.Button(row, text="Speichern unter…", command=lambda: self.save_konsil(save_as=True)).pack(side="left", padx=4)
         ttk.Button(row, text="Öffnen…", command=self.open_dialog).pack(side="left", padx=4)
         ttk.Checkbutton(row, text="Passkreuze", variable=self.show_marks).pack(side="left", padx=(12, 4))
+
+        tip = ttk.Frame(bar)
+        tip.pack(fill="x", pady=(4, 0))
+        ttk.Label(tip, text="ChatGPT").pack(side="left")
+        tip_entry = ttk.Entry(tip)
+        tip_entry.insert(0, FRAGESTELLUNG_TIP)
+        tip_entry.configure(state="readonly")
+        tip_entry.pack(side="left", fill="x", expand=True, padx=6)
+        tip_entry.bind("<FocusIn>", lambda e: e.widget.selection_range(0, "end"))
+        ttk.Button(tip, text="Kopieren", command=self._copy_frage_tip).pack(side="left")
         view = ttk.Frame(row)
         view.pack(side="right")
         self._stepper(view, "Zoom", self.zoom_pct, self._bump_zoom)
@@ -841,6 +856,12 @@ class FormApp(tk.Tk):
         self._mm_entry(stamp, self.stamp_w, "B")
         self._mm_entry(stamp, self.stamp_h, "H")
         ttk.Label(bar, textvariable=self.cursor_info, style="Hint.TLabel").pack(fill="x", pady=(3, 0))
+
+    def _copy_frage_tip(self):
+        self.clipboard_clear()
+        self.clipboard_append(FRAGESTELLUNG_TIP)
+        self.update_idletasks()
+        self.cursor_info.set("Fragestellung-Tipp ist in der Zwischenablage.")
 
     def _stepper(self, parent, caption: str, variable: tk.StringVar, command):
         ttk.Label(parent, text=caption).pack(side="left", padx=(12, 4))
