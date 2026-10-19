@@ -383,8 +383,9 @@ CAPTIONS = {
 }
 # Paste this into ChatGPT. 350 characters stays at full size on the four underlines.
 FRAGESTELLUNG_TIP = (
-    "Fragestellung auf Deutsch. Höchstens 350 Zeichen, etwa 45 Wörter. "
-    "Kein einzelnes Wort länger als 70 Zeichen."
+    "Erstelle die Fragestellung auf Deutsch aus den folgenden Rohinformationen. "
+    "Die ersten Wörter tragen die Hauptaussage und die Wichtigkeit. "
+    "Höchstens 350 Zeichen, etwa 45 Wörter. Kein einzelnes Wort länger als 70 Zeichen."
 )
 MARK_GROUPS = {
     "infekt": ("infekt_ja", "infekt_nein", "infekt_nicht"),
