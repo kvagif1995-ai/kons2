@@ -234,8 +234,11 @@ def remember_etikett(
     touch: bool = True,
     used_at: datetime | None = None,
     label_hint: str = "",
+    diagnose: str | None = None,
 ) -> Path | None:
-    """Keep one copy of a used label for three months. The same file updates its date."""
+    """Keep one copy of a used label for three months. The same file updates its date.
+
+    diagnose is stored with the label; None leaves the stored diagnosis unchanged."""
     if not source.is_file():
         return None
     when = used_at or datetime.now().replace(second=0, microsecond=0)
@@ -268,6 +271,7 @@ def remember_etikett(
             "source": source.name,
             "used_at": when.isoformat(timespec="minutes"),
         })
+        existing = rows[0]
     elif touch:
         previous = _parse_stamp_time(str(existing.get("used_at") or ""))
         if previous is None or when > previous:
@@ -280,12 +284,23 @@ def remember_etikett(
             current = str(existing.get("label") or "")
             if titled and (not current or current == Path(str(existing.get("source") or "")).stem):
                 existing["label"] = titled
+    if diagnose is not None and existing is not None:
+        existing["diagnose"] = " ".join(diagnose.split())
     rows.sort(key=lambda row: str(row.get("used_at") or ""), reverse=True)
     try:
         _write_etikett_index(rows)
     except OSError:
         return dest if dest.is_file() else None
     return dest
+
+
+def etikett_diagnose(path: Path | str) -> str | None:
+    """Diagnosis stored with a kept label, or None when none was saved."""
+    name = Path(str(path)).name
+    for row in _read_etikett_index():
+        if row.get("file") == name and "diagnose" in row:
+            return str(row.get("diagnose") or "")
+    return None
 
 
 def import_konsil_etiketten() -> None:
@@ -925,7 +940,12 @@ class FormApp(tk.Tk):
                 widget = self._make_block()
                 self._field_inputs[key] = widget
                 self._remember_field(widget, newline=True)
-                self._limit_lines(widget, 2)
+                self._limit_lines(widget, overlay.BOX_MAX_LINES)
+                widget.bind(
+                    "<KeyRelease>",
+                    lambda _e, field=key: self._layout_box(field, TEXT_FIELDS[field], not self.show_marks.get()),
+                    add="+",
+                )
             elif key == "station":
                 widget = StationEntry(self.preview, self._station_chosen)
                 self._field_inputs[key] = widget
@@ -959,7 +979,7 @@ class FormApp(tk.Tk):
         widget = tk.Text(
             self.preview,
             font=("Arial", 14, "bold"),
-            wrap="word",
+            wrap="none",
             relief="flat",
             bd=0,
             highlightthickness=1,
@@ -1623,10 +1643,12 @@ class FormApp(tk.Tk):
         width = max(20, self._px(box["w"]) - inset * 2)
         height = max(20, self._px(box["h"]) - inset * 2)
         pt = self._screen_pt(float(spec.get("size", 18)))
-        # Keep two lines inside the empty block.
-        while pt > 8:
+        typed = overlay.box_lines(widget.get("1.0", "end-1c")) or [""]
+        # No automatic wrapping: shrink until the typed lines fit the empty block.
+        while pt > 6:
             font = tkfont.Font(family="Arial", size=pt, weight="bold")
-            if font.metrics("linespace") * 2 + 8 <= height:
+            wide = max(font.measure(line) for line in typed)
+            if font.metrics("linespace") * len(typed) + 8 <= height and wide + 10 <= width:
                 break
             pt -= 1
         if getattr(widget, "_laid_pt", None) != pt:
@@ -2122,7 +2144,9 @@ class FormApp(tk.Tk):
         except OSError:
             pass
 
-    def _remember_stamp(self, path_text: str, *, warn: bool, label_hint: str = "") -> str:
+    def _remember_stamp(
+        self, path_text: str, *, warn: bool, label_hint: str = "", with_diagnose: bool = True
+    ) -> str:
         """Copy a chosen label into the three-month archive and return the path to use."""
         text = path_text.strip()
         if not text:
@@ -2130,7 +2154,8 @@ class FormApp(tk.Tk):
         source = Path(text)
         if not source.is_file():
             return text
-        kept = remember_etikett(source, label_hint=label_hint)
+        diagnose = self._get_value("diagnose") if with_diagnose else None
+        kept = remember_etikett(source, label_hint=label_hint, diagnose=diagnose)
         if kept is None:
             if warn:
                 messagebox.showwarning(
@@ -2141,6 +2166,11 @@ class FormApp(tk.Tk):
             return text
         return str(kept)
 
+    def _restore_diagnose(self, path: Path | str):
+        saved = etikett_diagnose(path)
+        if saved is not None:
+            self._set_value("diagnose", saved)
+
     def browse_stamp(self):
         path = filedialog.askopenfilename(
             title="Etikett-PDF",
@@ -2148,7 +2178,9 @@ class FormApp(tk.Tk):
             initialdir=str(ROOT),
         )
         if path:
-            self.stamp_path.set(self._remember_stamp(path, warn=True))
+            kept = self._remember_stamp(path, warn=True, with_diagnose=False)
+            self.stamp_path.set(kept)
+            self._restore_diagnose(kept)
 
     def open_saved_etikett(self):
         try:
@@ -2323,6 +2355,7 @@ class FormApp(tk.Tk):
             kept = remember_etikett(path)
             win.destroy()
             self.stamp_path.set(str(kept or path))
+            self._restore_diagnose(kept or path)
 
         def do_use(_event=None):
             if shown:

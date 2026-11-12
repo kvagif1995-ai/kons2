@@ -720,33 +720,17 @@ def _ink_width(text: str, font) -> float:
     return float(box[2] - box[0])
 
 
-def _two_lines(text: str, font, max_w: float) -> list[str]:
-    """One line when it fits, otherwise two. An explicit newline forces the break."""
-    cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    parts = [part.strip() for part in cleaned.split("\n")]
-    if len(parts) > 2:
-        parts = [parts[0], " ".join(part for part in parts[1:] if part)]
-    parts = [part for part in parts if part]
-    if not parts:
-        return []
-    if len(parts) >= 2:
-        return parts[:2]
+BOX_MAX_LINES = 3
 
-    words = parts[0].split()
-    if len(words) < 2 or _ink_width(parts[0], font) <= max_w:
-        return [parts[0]]
-    taken: list[str] = []
-    for word in words:
-        trial = " ".join(taken + [word])
-        if taken and _ink_width(trial, font) > max_w:
-            break
-        taken.append(word)
-    if not taken:
-        taken = [words[0]]
-    rest = " ".join(words[len(taken):]).strip()
-    if not rest:
-        return [" ".join(taken)]
-    return [" ".join(taken), rest]
+
+def box_lines(text: str) -> list[str]:
+    """Lines exactly as typed. Only an entered newline starts a new line."""
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+    parts = [" ".join(part.split()) for part in cleaned.split("\n")]
+    parts = [part for part in parts if part]
+    if len(parts) > BOX_MAX_LINES:
+        parts = parts[: BOX_MAX_LINES - 1] + [" ".join(parts[BOX_MAX_LINES - 1:])]
+    return parts
 
 
 def _line_box(font) -> tuple[int, int]:
@@ -772,10 +756,9 @@ def _draw_centered(
     bold = bool(spec.get("bold"))
     px = _pt_to_px(spec.get("size", 18) * ink_scale, dpi_y)
     font = _font(px, bold)
-    placed: list[str] = []
+    placed = box_lines(text)
     while True:
         font = _font(px, bold)
-        placed = _two_lines(text, font, max_w)
         ascent, descent = _line_box(font)
         line_h = ascent + descent
         gap = max(1, int(round(line_h * 0.12))) if len(placed) > 1 else 0
@@ -783,7 +766,7 @@ def _draw_centered(
         too_wide = any(_ink_width(line, font) > max_w for line in placed)
         if placed and not too_wide and block_h <= max_h:
             break
-        if px <= 8:
+        if px <= 6:
             break
         px -= 1
     if not placed:
