@@ -6,4 +6,5 @@
 - No automatic line wrapping in form text fields; only user-entered newlines break lines. Shrink the font instead.
 - Keep changes small and focused; no refactors beyond the task.
 - Windows only (pywin32 / GDI printing). Run with `start.bat` or `python app.py`.
+- Commit after each finished task, but only when the user asks. Check `git status` first so no patient data is included.
 - Update `WORKLOG.md` after each work session; tick items in `PLAN.md`.
